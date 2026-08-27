@@ -81,6 +81,160 @@ python train.py -s path/to/your/RGBT-Scenes/scene_name --eval --data_branch rgbt
 
 The default schedule trains for 30k iterations.
 
+### Temperature-dependent emissivity training
+
+Stage 1 uses only RGB observations and jointly optimizes the standard RGB 3DGS
+geometry variables (position, rotation, scale, and opacity) and RGB SH appearance
+(`f_dc`/`f_rest`). Thermal SH appearance, thermal correction, temporal deformation,
+and physical parameters are frozen:
+
+```shell
+python train.py -s data/RGBT-Scenes/scene -m output/scene_stage1 --data_branch rgbt \
+  --eval --rgb_geometry_stage --iterations 30000
+```
+
+`--iterations` is a maximum budget. Stage 1 stops earlier only when held-out RGB
+PSNR has reached a plateau and the normalized updates of position, scale,
+rotation, and opacity are simultaneously below the stability threshold after
+densification ends. If the maximum is reached first, training raises an error and
+does not create a canonical stage endpoint; increase the maximum or inspect the
+geometry instead of silently continuing with a non-converged checkpoint.
+
+Then freeze this checkpoint and train the constant-emissivity stage 2:
+
+```shell
+python train_thermal_physics.py -s data/RGBT-Scenes/scene -m output/scene_stage2 \
+  --eval \
+  --stage stage2 --geometry_model output/scene_stage1 --geometry_iteration -1 \
+  --metal_mask_dir data/RGBT-Scenes/scene/metal_masks --steps 10000
+```
+
+The optional B0 control fits thermal images with unconstrained thermal SH on the
+same frozen geometry and explicitly marks its output as having no physical
+temperature meaning:
+
+```shell
+python train_thermal_image_baseline.py -s data/RGBT-Scenes/scene -m output/scene_B0 \
+  --eval --geometry_model output/scene_stage1 --geometry_iteration -1 --steps 5000
+```
+
+A grayscale SAM2 mask uses white for metal and black for non-metal and shares
+the thermal image stem. Put masks under `metal_masks/`, `metal_masks/train/`, or
+`metal_masks/test/`. They are projected to Gaussians and averaged across views.
+Formal thesis training requires one binary mask for every training view. A view
+without metal must still have an all-black mask (or an empty `objects` prompt
+entry). The explicit
+`--allow_missing_metal_masks` escape hatch assigns everything to non-metal and is
+only for pipeline smoke tests, not reportable experiments. Defaults are
+epsilon_0=0.3 for metal and 0.9 for non-metal.
+
+Stage 2 optimizes per-Gaussian temperature and environmental irradiance while
+keeping geometry and epsilon_0 fixed. It writes `thermal_stage2_best.pt` using
+held-out radiance loss and stops only when validation reaches a plateau and the
+updates of both T and E are stable.
+Its environment parameterization and prior follow the repository's simplified
+physical baseline: sigmoid-bounded per-Gaussian irradiance, initialized from the
+0.1 observation quantile and Huber-anchored with beta 0.02 and weight 0.01.
+If these two conditions are not met by `--steps`, the diagnostic final checkpoint
+is retained but `thermal_stage2_common.pt` is not created, so C/K/R cannot start
+from a falsely declared common endpoint.
+
+The stage-1 endpoint is always mirrored to an iteration newer than the optional
+best-PSNR snapshot, so `--geometry_iteration -1` resolves to the actual stable
+stage endpoint. Stage 2 writes `thermal_stage2_common.pt` from its actual stopping
+state; C, K, and R must use this file. `thermal_stage2_best.pt` is diagnostic only.
+
+RGBT-Scenes PNG/JPEG thermal observations are uncalibrated normalized DN. This
+mode is intentionally qualitative and must not be reported as absolute
+thermodynamic temperature. If camera calibration supplies the physical 8--14 um
+band radiance at DN=0 and DN=1, enable calibrated training:
+
+```shell
+python train_thermal_physics.py ... --observation_domain calibrated_radiance \
+  --dn0_radiance RADIANCE_AT_DN_0 --dn1_radiance RADIANCE_AT_DN_1
+```
+
+For synthetic data, optional per-Gaussian temperature truth can be shared by
+all branches with `--temperature_gt temperatures.npy` and
+`--lambda_temperature_supervision WEIGHT`; MAE and RMSE in Kelvin are then logged.
+
+Start C, K and R from the exact same stage-2 checkpoint, with identical `--steps`
+and `--seed`. Formal runs must share one comparison lock file. K/R additionally
+must consume the regularization values selected on synthetic validation:
+
+```shell
+python train_thermal_physics.py -s data/RGBT-Scenes/scene -m output/scene_C --eval --stage branch --branch C --geometry_model output/scene_stage1 --stage2_checkpoint output/scene_stage2/thermal_stage2_common.pt --comparison_protocol output/comparison_protocol.json --regularization_protocol output/regularization_scan/regularization_scan.json --steps 5000 --seed 0
+python train_thermal_physics.py -s data/RGBT-Scenes/scene -m output/scene_K --eval --stage branch --branch K --geometry_model output/scene_stage1 --stage2_checkpoint output/scene_stage2/thermal_stage2_common.pt --comparison_protocol output/comparison_protocol.json --regularization_protocol output/regularization_scan/regularization_scan.json --steps 5000 --seed 0
+python train_thermal_physics.py -s data/RGBT-Scenes/scene -m output/scene_R --eval --stage branch --branch R --geometry_model output/scene_stage1 --stage2_checkpoint output/scene_stage2/thermal_stage2_common.pt --comparison_protocol output/comparison_protocol.json --regularization_protocol output/regularization_scan/regularization_scan.json --steps 5000 --seed 0
+```
+
+The physical renderer uses a uniform 8--14 um Planck passband and blends
+radiance. C keeps fixed emissivity, K learns a temperature coefficient per
+material, and R learns an equal-count constant emissivity residual. Geometry and
+base emissivity are frozen in all three branches.
+
+In the thesis naming, B0 is `train_thermal_image_baseline.py`, B1 is branch C,
+B2 is branch R, and B3 is branch K.
+
+To run the complete training sequence with the documented budgets:
+
+```shell
+bash scripts/run_thesis_thermal_training.sh data/RGBT-Scenes/scene output/scene_experiment data/RGBT-Scenes/scene/metal_masks output/regularization_scan/regularization_scan.json
+```
+
+### SAM2 metal masks
+
+The official Meta SAM2 source is vendored under `third_party/sam2`. The simplified
+pipeline uses only two labels: prompt-marked foreground is metal and every other
+pixel is non-metal; no open-vocabulary or multi-material classifier is used. SAM2 requires Python
+3.10+ and PyTorch 2.5.1+, while this PhysIR baseline pins older PyTorch, so generate
+masks in a separate environment and consume the PNG masks in the training environment:
+
+```shell
+conda create -n sam2 python=3.10
+conda activate sam2
+# Install a CUDA-compatible PyTorch >=2.5.1 first.
+pip install -e third_party/sam2
+bash scripts/download_sam2_checkpoint.sh
+```
+
+Create `material_prompts.json` using `material_prompts.example.json` as the
+template, then generate binary metal masks for each RGB split:
+
+```shell
+python tools/generate_sam2_metal_masks.py \
+  --image_dir data/RGBT-Scenes/scene/rgb/train \
+  --prompts material_prompts.json \
+  --output_dir data/RGBT-Scenes/scene/metal_masks/train \
+  --checkpoint third_party/sam2/checkpoints/sam2.1_hiera_tiny.pt
+```
+
+Metal masks and thermal observations are mapped to Gaussians using multi-view
+probability averaging, the 3DGS rasterizer visibility test, and a full-resolution
+projected-centre depth test that rejects back surfaces.
+
+### Material-prior regularization scan
+
+Do not select lambda values on a real test scene. On a synthetic validation
+scene, scan K and R regularization with repeated seeds:
+
+```shell
+python tools/scan_material_regularization.py \
+  --source data/synthetic/validation_scene \
+  --geometry_model output/synthetic_stage1 \
+  --stage2_checkpoint output/synthetic_stage2/thermal_stage2_common.pt \
+  --output_root output/regularization_scan \
+  --confirm_synthetic_validation
+```
+
+The generated `regularization_scan.json` contains validation means, standard
+deviations, material-parameter stability, and the selected K/R values. Freeze
+those values for all subsequent scenes. Formal C/K/R commands reject missing or
+non-synthetic scan protocols. The complete script also writes
+`thermal_branch_comparison.json`, which validates equal budgets/seeds and reports
+training loss, validation radiance error, available temperature error, and
+parameter stability for C/K/R.
+
 ## Rendering And Evaluation
 
 ```shell

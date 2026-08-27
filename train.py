@@ -609,8 +609,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
         planck_model.load_weights(checkpoint_model_path, iteration=start_iteration)
         radiometric_model.load_weights(checkpoint_model_path, iteration=start_iteration)
     has_rgbt = getattr(scene, "has_rgbt", False)
+    if getattr(opt, "rgb_geometry_stage", False) and not has_rgbt:
+        raise RuntimeError("--rgb_geometry_stage requires an RGBT scene with paired RGB/thermal views")
+    rgb_geometry_only = bool(has_rgbt and getattr(opt, "rgb_geometry_stage", False))
+    if rgb_geometry_only:
+        if not scene.getTrainCameras() or not scene.getTestCameras():
+            raise RuntimeError("Stage 1 requires non-empty training and held-out validation camera sets")
+        if any(camera.original_rgb_image is None for camera in scene.getTrainCameras() + scene.getTestCameras()):
+            raise RuntimeError("Stage 1 requires an RGB observation for every training/validation camera")
+        print("[STAGE1] RGB geometry + appearance training; thermal features are frozen.")
+        # Stage 1 inherits the baseline RGB 3DGS: the RGB SH (f_dc/f_rest) keeps
+        # training alongside geometry so the colour residual is absorbed by the
+        # appearance channel instead of polluting the geometric gradient. Only the
+        # thermal branch is frozen, since it belongs to the later physical stages.
+        for parameter in (gaussians._features_dc, gaussians._features_rest):
+            if torch.is_tensor(parameter):
+                parameter.requires_grad_(True)
+        for parameter in (gaussians._thermal_features_dc, gaussians._thermal_features_rest):
+            if torch.is_tensor(parameter):
+                parameter.requires_grad_(False)
+        for group in gaussians.optimizer.param_groups:
+            if group.get("name") in ("thermal_dc", "thermal_rest"):
+                group["lr"] = 0.0
     rgb_geo_model = None
-    if has_rgbt:
+    if has_rgbt and not rgb_geometry_only:
         rgb_geo_model = GeoRefineModel(
             device,
             dataset.is_blender,
@@ -620,7 +642,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
         rgb_geo_model.train_setting(opt)
         print("Using separate thermal/RGB view-dependent geometry refinement.")
     temporal_affine_model = None
-    if opt.ir_temporal_affine:
+    if opt.ir_temporal_affine and not rgb_geometry_only:
         train_fids = [float(cam.fid.item()) for cam in scene.getTrainCameras()]
         temporal_affine_model = TemporalAffineModel(
             device,
@@ -648,7 +670,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
             f"(mode={temporal_affine_model.mode}, train_fids={len(train_fids)})."
         )
     temporal_pose_model = None
-    if opt.ir_temporal_pose:
+    if opt.ir_temporal_pose and not rgb_geometry_only:
         train_fids = [float(cam.fid.item()) for cam in scene.getTrainCameras()]
         temporal_pose_model = TemporalPoseModel(
             device,
@@ -821,6 +843,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
     ema_loss_for_log = 0.0
     best_psnr = 0.0
     best_iteration = 0
+    stage1_plateau_best = float("-inf")
+    stage1_plateau_checks = 0
+    stage1_geometry_snapshot = None
+    last_completed_iteration = start_iteration
+    stage1_converged = False
     progress_bar = tqdm(
         total=max(opt.iterations - start_iteration, 0),
         desc="Training progress",
@@ -846,6 +873,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
         )
     # for iteration in range(1, opt.iterations + 1):
     for iteration in range(start_iteration + 1, opt.iterations + 1):
+        last_completed_iteration = iteration
+        stage1_should_stop = False
         iter_start.record()
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
@@ -874,7 +903,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
         pose_trans = None
         pose_rotvec = None
         pose_reg = None
-        if iteration < opt.warm_up:
+        if rgb_geometry_only or iteration < opt.warm_up:
             d_xyz_full, d_rotation_full, d_scaling_full = 0.0, 0.0, 0.0
         else:
             R = viewpoint_cam.R
@@ -912,7 +941,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
                 opacity = gaussians.get_opacity
                 scales = gaussians.get_scaling
                 rotations = gaussians.get_rotation
-                shs = gaussians.get_thermal_features if has_rgbt else gaussians.get_features
+                shs = gaussians.get_features if rgb_geometry_only else (gaussians.get_thermal_features if has_rgbt else gaussians.get_features)
             
                 rasterizer = GaussianRasterizer(raster_settings)
                 _, radii, _ = rasterizer(
@@ -966,7 +995,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
         # Render
         radiative_blend = (
             physir_render_blend(iteration, opt)
-            if opt.phys_main_render and gaussians.has_radiative_transfer_attributes()
+            if not rgb_geometry_only and opt.phys_main_render and gaussians.has_radiative_transfer_attributes()
             else 0.0
         )
         radiative_color = gaussians.get_physir_response_rgb if radiative_blend > 0.0 else None
@@ -982,7 +1011,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
             dataset.is_6dof,
             radiative_color=radiative_color,
             radiative_blend=radiative_blend,
-            feature_set="thermal" if has_rgbt else "rgb",
+            feature_set="rgb" if rgb_geometry_only else ("thermal" if has_rgbt else "rgb"),
         )
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg_re["render"], render_pkg_re[
             "viewspace_points"], render_pkg_re["visibility_filter"], render_pkg_re["radii"]
@@ -1010,7 +1039,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
                     max(float(time_interval), 1e-8),
                 )
 
-        gt_image = viewpoint_cam.original_image.to(device)
+        gt_image = (viewpoint_cam.original_rgb_image if rgb_geometry_only else viewpoint_cam.original_image).to(device)
         
         # Loss
         Ll1 = l1_loss(image, gt_image)
@@ -1078,7 +1107,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
         late_consistency_weight = float(getattr(opt, "ir_late_consistency_weight", 0.2))
         late_ssim_weight = float(getattr(opt, "ir_late_ssim_weight", opt.lambda_dssim))
         late_start_iter = int(getattr(opt, "ir_late_consistency_start_iter", 20000))
-        if iteration <= late_start_iter or late_consistency_weight <= 0.0:
+        if rgb_geometry_only or iteration <= late_start_iter or late_consistency_weight <= 0.0:
             loss = (1.0 - opt.lambda_dssim) * photo_loss + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         else:
             tir_consistency_loss = compute_rt_consistency_loss(
@@ -1148,7 +1177,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
         rgb_loss = None
         rgb_detail_loss = None
         rgb_render_pkg = None
-        if has_rgbt and viewpoint_cam.original_rgb_image is not None and opt.rgbt_rgb_loss_weight > 0.0:
+        if has_rgbt and not rgb_geometry_only and viewpoint_cam.original_rgb_image is not None and opt.rgbt_rgb_loss_weight > 0.0:
             rgb_d_xyz_full, rgb_d_rotation_full, rgb_d_scaling_full = compute_geo_fields(
                 viewpoint_cam,
                 gaussians,
@@ -1191,7 +1220,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
                 rgb_detail_loss = gradient_l1_loss(rgb_image, gt_rgb_image)
                 loss = loss + rgb_detail_weight * rgb_detail_loss
 
-        physics_loss, _ = rt_guidance_loss(gaussians, opt, iteration)
+        physics_loss = image.new_zeros(()) if rgb_geometry_only else rt_guidance_loss(gaussians, opt, iteration)[0]
         loss = loss + physics_loss
         if temporal_reg is not None and opt.ir_temporal_affine_reg_weight > 0.0:
             loss = loss + opt.ir_temporal_affine_reg_weight * temporal_reg
@@ -1234,7 +1263,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
             )
             loss = loss + geometry_smooth_weight * geo_smooth_reg
 
-        if tir_auxiliary_gate(iteration, opt) > 0.0 and gaussians.has_radiative_transfer_attributes():
+        if not rgb_geometry_only and tir_auxiliary_gate(iteration, opt) > 0.0 and gaussians.has_radiative_transfer_attributes():
             with torch.no_grad():
                 confidence_color = radiative_confidence_values(gaussians, opt).repeat(1, 3).contiguous()
                 confidence_image = torch.clamp(
@@ -1492,6 +1521,44 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
                                        temporal_affine_model=temporal_affine_model,
                                        temporal_pose_model=temporal_pose_model)
             if iteration in testing_iterations:
+                if rgb_geometry_only:
+                    geometry_now = tuple(
+                        value.detach().clone()
+                        for value in (gaussians._xyz, gaussians._scaling, gaussians._rotation, gaussians._opacity)
+                    )
+                    geometry_delta = float("inf")
+                    if stage1_geometry_snapshot is not None and all(
+                        current.shape == previous.shape
+                        for current, previous in zip(geometry_now, stage1_geometry_snapshot)
+                    ):
+                        xyz_delta = (geometry_now[0] - stage1_geometry_snapshot[0]).abs().mean()
+                        xyz_delta = xyz_delta / max(float(scene.cameras_extent), 1e-6)
+                        other_delta = torch.stack([
+                            (geometry_now[index] - stage1_geometry_snapshot[index]).abs().mean()
+                            for index in (1, 2, 3)
+                        ]).mean()
+                        geometry_delta = float((xyz_delta + other_delta).item())
+                    stage1_geometry_snapshot = geometry_now
+                    if float(cur_psnr.item()) > stage1_plateau_best + opt.rgb_geometry_early_stop_min_delta:
+                        stage1_plateau_best = float(cur_psnr.item())
+                        stage1_plateau_checks = 0
+                    else:
+                        stage1_plateau_checks += 1
+                    geometry_stable = (
+                        iteration >= opt.densify_until_iter
+                        and geometry_delta <= opt.rgb_geometry_stability_tol
+                    )
+                    print(
+                        "[STAGE1_STOP] iter={} psnr={:.4f} stale={} geometry_delta={:.8f} stable={}".format(
+                            iteration, float(cur_psnr.item()), stage1_plateau_checks,
+                            geometry_delta, geometry_stable,
+                        )
+                    )
+                    stage1_should_stop = (
+                        opt.rgb_geometry_early_stop_patience > 0
+                        and stage1_plateau_checks >= opt.rgb_geometry_early_stop_patience
+                        and geometry_stable
+                    )
                 if cur_psnr.item() > best_psnr:
                     best_psnr = cur_psnr.item()
                     best_iteration = iteration
@@ -1507,7 +1574,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
                         )
                         save_training_state(best_mirror_iteration)
 
-            if opt.phys_probe_every > 0 and iteration % opt.phys_probe_every == 0:
+            if not rgb_geometry_only and opt.phys_probe_every > 0 and iteration % opt.phys_probe_every == 0:
                 fit_and_log_physir_attributes(iteration, gaussians, scene, opt, model_path, prev_probe_point_count)
                 prev_probe_point_count = gaussians.get_xyz.shape[0]
                 # Detailed radiative guidance and auxiliary-loss diagnostics are
@@ -1579,6 +1646,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
                         budget_recycle_opacity=opt.densify_budget_recycle_opacity,
                         budget_recycle_grad_factor=opt.densify_budget_recycle_grad_factor,
                     )
+                    if rgb_geometry_only:
+                        # Densification replaces Parameter objects. Keep the newly
+                        # cloned thermal-appearance tensors frozen; the RGB SH
+                        # (f_dc/f_rest) stays trainable with the geometry.
+                        for parameter in (gaussians._features_dc, gaussians._features_rest):
+                            if torch.is_tensor(parameter):
+                                parameter.requires_grad_(True)
+                        for parameter in (gaussians._thermal_features_dc, gaussians._thermal_features_rest):
+                            if torch.is_tensor(parameter):
+                                parameter.requires_grad_(False)
+                        for group in gaussians.optimizer.param_groups:
+                            if group.get("name") in ("thermal_dc", "thermal_rest"):
+                                group["lr"] = 0.0
                     if opt.densify_log_every > 0 and iteration % opt.densify_log_every == 0:
                         densify_msg = (
                             "\n[DENSIFY][iter {iter}] mode={mode} before={before} cloned={cloned} "
@@ -1673,10 +1753,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
                     result_file.write(needle_msg + "\n")
 
             # Optimizer step
-            if iteration < opt.iterations:
+            # When the convergence test fires, persist the exact evaluated
+            # state; do not apply one unmeasured update before the endpoint.
+            if iteration < opt.iterations and not stage1_should_stop:
                 gaussians.optimizer.step()
                 gaussians.update_learning_rate(iteration)
-                if iteration < opt.geometry_train_until_iter:
+                if not rgb_geometry_only and iteration < opt.geometry_train_until_iter:
                     if opt.geometry_grad_clip_norm > 0.0:
                         torch.nn.utils.clip_grad_norm_(
                             geo_model.geometry.parameters(),
@@ -1695,12 +1777,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
                     temporal_affine_model.optimizer.step()
                 if temporal_pose_model is not None:
                     temporal_pose_model.optimizer.step()
-                atmos_model.optimizer.step()
-                planck_model.optimizer.step()
-                radiometric_model.optimizer.step()
+                if not rgb_geometry_only:
+                    atmos_model.optimizer.step()
+                    planck_model.optimizer.step()
+                    radiometric_model.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
                 geo_model.optimizer.zero_grad()
-                if iteration < opt.geometry_train_until_iter:
+                if not rgb_geometry_only and iteration < opt.geometry_train_until_iter:
                     geo_model.update_learning_rate(iteration)
                 if rgb_geo_model is not None:
                     rgb_geo_model.optimizer.zero_grad()
@@ -1710,12 +1793,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, device):
                     temporal_affine_model.optimizer.zero_grad()
                 if temporal_pose_model is not None:
                     temporal_pose_model.optimizer.zero_grad()
-                atmos_model.optimizer.zero_grad()
-                planck_model.optimizer.zero_grad()
-                radiometric_model.optimizer.zero_grad()
-                atmos_model.update_learning_rate(iteration)
-                planck_model.update_learning_rate(iteration)
-                radiometric_model.update_learning_rate(iteration)
+                if not rgb_geometry_only:
+                    atmos_model.optimizer.zero_grad()
+                    planck_model.optimizer.zero_grad()
+                    radiometric_model.optimizer.zero_grad()
+                    atmos_model.update_learning_rate(iteration)
+                    planck_model.update_learning_rate(iteration)
+                    radiometric_model.update_learning_rate(iteration)
+
+            if stage1_should_stop:
+                stage1_converged = True
+                print("[STAGE1] Validation plateau and geometry stability reached; saving and stopping.")
+                save_training_state(iteration)
+                progress_bar.close()
+                break
+
+    if rgb_geometry_only:
+        if opt.rgb_geometry_early_stop_patience > 0 and not stage1_converged:
+            raise RuntimeError(
+                "Stage 1 reached --iterations without satisfying both validation plateau and geometry stability. "
+                "Increase --iterations or inspect the geometry; no canonical endpoint was created."
+            )
+        stage1_endpoint_iteration = int(opt.iterations) + 2
+        print(
+            "[STAGE1] Saving canonical endpoint from actual iteration {} as iteration_{}.".format(
+                last_completed_iteration, stage1_endpoint_iteration,
+            )
+        )
+        save_training_state(stage1_endpoint_iteration)
 
     print("Best PSNR = {} in Iteration {}".format(best_psnr, best_iteration))
 
@@ -1834,13 +1939,18 @@ def training_report(source_path, model_path, tb_writer, iteration, Ll1, loss, l1
                             scene.cameras_extent,
                             radiative_color=radiative_color,
                             radiative_blend=radiative_blend,
-                            feature_set="thermal" if getattr(scene, "has_rgbt", False) else "rgb",
+                            feature_set=(
+                                "rgb" if bool(getattr(opt, "rgb_geometry_stage", False))
+                                else ("thermal" if getattr(scene, "has_rgbt", False) else "rgb")
+                            ),
                             eval_temporal_interval=eval_temporal_interval,
                             temporal_affine_model=temporal_affine_model,
                             temporal_pose_model=temporal_pose_model,
                         ),
                         0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to(device), 0.0, 1.0)
+                    rgb_stage = bool(getattr(opt, "rgb_geometry_stage", False) and getattr(scene, "has_rgbt", False))
+                    primary_gt = viewpoint.original_rgb_image if rgb_stage else viewpoint.original_image
+                    gt_image = torch.clamp(primary_gt.to(device), 0.0, 1.0)
                     image_metric = quantize_like_save_image(image)
                     gt_metric = quantize_like_save_image(gt_image)
    
@@ -1848,7 +1958,7 @@ def training_report(source_path, model_path, tb_writer, iteration, Ll1, loss, l1
                     gts = torch.cat((gts, gt_metric.unsqueeze(0)), dim=0)
                     image_names.append(str(getattr(viewpoint, "image_name", idx)))
 
-                    if getattr(scene, "has_rgbt", False) and viewpoint.original_rgb_image is not None:
+                    if getattr(scene, "has_rgbt", False) and not rgb_stage and viewpoint.original_rgb_image is not None:
                         rgb_image = torch.clamp(
                             render_eval_view(
                                 viewpoint,
@@ -1887,7 +1997,10 @@ def training_report(source_path, model_path, tb_writer, iteration, Ll1, loss, l1
                 if config['name'] == 'test' or len(validation_configs[0]['cameras']) == 0:
                     test_psnr = psnr_test
                 result_file_path = os.path.join(model_path, "result.txt")
-                thermal_label = "{} Thermal".format(config['name']) if getattr(scene, "has_rgbt", False) else config['name']
+                thermal_label = (
+                    "{} RGB-geometry".format(config['name']) if bool(getattr(opt, "rgb_geometry_stage", False))
+                    else ("{} Thermal".format(config['name']) if getattr(scene, "has_rgbt", False) else config['name'])
+                )
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, thermal_label, l1_test, psnr_test))
                 with open(result_file_path, "a") as result_file:
                     result_file.write("[ITER {}] Evaluating {}: L1 {} PSNR {}\n".format(iteration, thermal_label, l1_test, psnr_test))
@@ -1964,7 +2077,18 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 10_000, 20_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(sys.argv[1:])
+    if getattr(args, "rgb_geometry_stage", False) and args.rgb_geometry_early_stop_patience <= 0:
+        raise ValueError(
+            "--rgb_geometry_stage requires --rgb_geometry_early_stop_patience > 0; "
+            "the thesis stage-1 endpoint must satisfy validation plateau and geometry stability"
+        )
     args.save_iterations.append(args.iterations)
+    if getattr(args, "rgb_geometry_stage", False):
+        args.test_iterations = sorted(set(
+            list(args.test_iterations)
+            + list(range(5_000, int(args.iterations) + 1, 1_000))
+            + [int(args.iterations)]
+        ))
 
     print("Optimizing " + args.model_path)
 

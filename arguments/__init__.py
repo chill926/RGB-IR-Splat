@@ -114,6 +114,13 @@ class OptimizationParams(ParamGroup):
         self.rgbt_rgb_feature_lr_mult = 1.0
         self.rgbt_rgb_detach_geometry = 0
         self.rgbt_save_best_eval_checkpoint = True
+        # Stage 1 of the temperature-recovery thesis: jointly optimize canonical
+        # geometry and RGB SH (f_dc/f_rest). Thermal appearance and all thermal-
+        # physics variables are excluded; later stages freeze the stage-1 state.
+        self.rgb_geometry_stage = False
+        self.rgb_geometry_early_stop_patience = 5
+        self.rgb_geometry_early_stop_min_delta = 0.01
+        self.rgb_geometry_stability_tol = 1e-4
         self.opacity_lr = 0.05
         self.scaling_lr = 0.001
         self.rotation_lr = 0.001

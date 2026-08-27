@@ -1,0 +1,7 @@
+Source: https://github.com/facebookresearch/sam2
+Branch: main
+Commit at download time: 2b90b9f5ceec907a1c18123530e92e794ad901a4
+Downloaded: 2026-08-24
+
+The upstream repository was downloaded as a source archive. Model checkpoints
+are intentionally not included; use scripts/download_sam2_checkpoint.sh.

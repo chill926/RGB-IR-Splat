@@ -127,8 +127,31 @@ def _image_name_to_time(image_name: str, idx: int, num_frames: int, frame_index_
     return idx / float(max(num_frames - 1, 1))
 
 
-def _thermal_to_gray_rgb(image: Image.Image) -> Image.Image:
-    return image.convert("L").convert("RGB")
+def _thermal_to_gray_rgb(image: Image.Image) -> np.ndarray:
+    """Return normalized float RGB while preserving integer thermal bit depth."""
+    array = np.asarray(image)
+    if array.ndim not in (2, 3):
+        raise ValueError(f"Unsupported thermal image shape: {array.shape}")
+    if np.issubdtype(array.dtype, np.integer):
+        scale = float(np.iinfo(array.dtype).max)
+        normalized = array.astype(np.float32) / scale
+    elif np.issubdtype(array.dtype, np.floating):
+        normalized = array.astype(np.float32)
+        if not np.isfinite(normalized).all():
+            raise ValueError("Thermal image contains NaN or infinite values")
+        if normalized.min() < 0.0 or normalized.max() > 1.0:
+            raise ValueError("Floating-point thermal images must already be normalized to [0, 1]")
+    else:
+        raise ValueError(f"Unsupported thermal image dtype: {array.dtype}")
+    if normalized.ndim == 3:
+        if normalized.shape[2] < 3:
+            gray = normalized[..., 0]
+        else:
+            gray = (0.299 * normalized[..., 0] + 0.587 * normalized[..., 1]
+                    + 0.114 * normalized[..., 2])
+    else:
+        gray = normalized
+    return np.repeat(gray[..., None], 3, axis=2).astype(np.float32, copy=False)
 
 
 def _attach_sparse_depth(cam_infos, pcd):
@@ -281,8 +304,10 @@ def readRGBTCameras(cam_extrinsics, cam_intrinsics, rgb_folder, thermal_folder):
             continue
 
         rgb_image = Image.open(rgb_path).convert("RGB")
-        thermal_image = Image.open(thermal_path).convert("RGB")
-        physical_image = _thermal_to_gray_rgb(thermal_image)
+        with Image.open(thermal_path) as thermal_source:
+            physical_image = _thermal_to_gray_rgb(thermal_source)
+        thermal_u8 = np.rint(physical_image[..., 0] * 255.0).clip(0, 255).astype(np.uint8)
+        thermal_image = Image.fromarray(thermal_u8, mode="L").convert("RGB")
         image_name = Path(basename).stem
         fid = _image_name_to_time(image_name, idx, num_frames, frame_index_base)
 

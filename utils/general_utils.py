@@ -10,6 +10,7 @@
 #
 
 import torch
+import torch.nn.functional as F
 import sys
 from datetime import datetime
 import numpy as np
@@ -30,13 +31,23 @@ def PILtoTorch(pil_image, resolution):
 
 
 def ArrayToTorch(array, resolution):
-    # resized_image = np.resize(array, resolution)
-    resized_image_torch = torch.from_numpy(array)
-
-    if len(resized_image_torch.shape) == 3:
-        return resized_image_torch.permute(2, 0, 1)
-    else:
-        return resized_image_torch.unsqueeze(dim=-1).permute(2, 0, 1)
+    """Convert a normalized numpy image to CHW and resize without quantizing it."""
+    value = np.ascontiguousarray(array)
+    tensor = torch.from_numpy(value).float()
+    if tensor.ndim == 2:
+        tensor = tensor.unsqueeze(-1)
+    if tensor.ndim != 3:
+        raise ValueError("ArrayToTorch expects an HxW or HxWxC image")
+    tensor = tensor.permute(2, 0, 1)
+    target_width, target_height = int(resolution[0]), int(resolution[1])
+    if tensor.shape[1:] != (target_height, target_width):
+        tensor = F.interpolate(
+            tensor.unsqueeze(0),
+            size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=False,
+        )[0]
+    return tensor
 
 
 def get_expon_lr_func(

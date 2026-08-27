@@ -62,7 +62,10 @@ def loadCam(args, id, cam_info, resolution_scale):
 
     physical_image = None
     if getattr(cam_info, "physical_image", None) is not None:
-        physical_tensor = PILtoTorch(cam_info.physical_image, resolution)
+        if isinstance(cam_info.physical_image, np.ndarray):
+            physical_tensor = ArrayToTorch(cam_info.physical_image, resolution)
+        else:
+            physical_tensor = PILtoTorch(cam_info.physical_image, resolution)
         if physical_tensor.shape[0] == 1:
             physical_tensor = physical_tensor.repeat(3, 1, 1)
         physical_image = physical_tensor[:3, ...]
