@@ -10,6 +10,7 @@
 #
 
 import torch
+from pathlib import Path
 from scene import Scene, GeoRefineModel, TemporalAffineModel, TemporalPoseModel
 import os
 import re
@@ -34,6 +35,7 @@ import imageio
 import numpy as np
 import time
 from PIL import Image
+from utils.thermal_physics import MaterialThermalField, UniformLWIRPlanckLUT
 
 try:
     from scene.thermal_correction_model import ThermalCorrectionModel
@@ -41,8 +43,71 @@ except ImportError:
     ThermalCorrectionModel = None
 
 
-def render_and_save_physical_fields(*_args, **_kwargs):
-    raise RuntimeError("physical_fields mode is unavailable in this branch.")
+def render_and_save_physical_fields(scene, gaussians, _geo_model, pipeline, model_path,
+                                    opt, _iteration, device, is_6dof,
+                                    load2gpu_on_the_fly):
+    checkpoint_path = getattr(opt, "thermal_checkpoint", "")
+    if not checkpoint_path:
+        raise ValueError("physical_fields mode requires --thermal_checkpoint")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    branch = checkpoint.get("branch")
+    if branch not in MaterialThermalField.BRANCHES:
+        raise ValueError(f"Invalid thermal checkpoint branch: {branch}")
+    field = MaterialThermalField.from_checkpoint(
+        checkpoint, branch, device, reset_branch_parameters=False).eval()
+    if field.temperature.shape[0] != gaussians.get_xyz.shape[0]:
+        raise ValueError("Thermal checkpoint and geometry contain different Gaussian counts")
+    config = checkpoint["config"]
+    planck = UniformLWIRPlanckLUT(config["temp_min"], config["temp_max"]).to(device)
+    output_root = Path(getattr(opt, "physical_output", "") or
+                       (Path(checkpoint_path).resolve().parent / "physical_fields"))
+    output_root.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "branch": branch,
+        "temperature_K": field.temperature.detach().cpu(),
+        "emissivity": field.emissivity().detach().cpu(),
+        "radiance": field.radiance(planck).detach().cpu(),
+        "environment": field.environment.detach().cpu(),
+        "material_ids": field.material_ids.detach().cpu(),
+        "material_confidence": field.material_confidence.detach().cpu(),
+        "material_names": field.material_names,
+    }, output_root / "gaussian_fields.pt")
+
+    zeros = torch.zeros(3, device=device)
+    scalar_fields = {
+        "radiance": field.radiance(planck),
+        "temperature_K": field.temperature,
+        "emissivity": field.emissivity(),
+        "material_confidence": field.material_confidence[:, None],
+        "material_id": (field.material_ids[:, None].float() + 1.0) /
+                       float(len(field.material_names) + 1),
+    }
+    for split, views in (("train", scene.getTrainCameras()), ("test", scene.getTestCameras())):
+        for name in scalar_fields:
+            (output_root / split / name).mkdir(parents=True, exist_ok=True)
+        for view in tqdm(views, desc=f"Rendering physical fields ({split})"):
+            if load2gpu_on_the_fly:
+                view.load2device(device)
+            coverage = render(
+                view, gaussians, pipeline, zeros, 0.0, 0.0, 0.0, device,
+                is_6dof, override_color=torch.ones_like(field.temperature).repeat(1, 3),
+                detach_geometry=True)["render"][:1].clamp_min(1e-6)
+            for name, values in scalar_fields.items():
+                image = render(
+                    view, gaussians, pipeline, zeros, 0.0, 0.0, 0.0, device,
+                    is_6dof, override_color=values.repeat(1, 3), detach_geometry=True)["render"][:1]
+                if name != "radiance":
+                    image = image / coverage
+                np.save(output_root / split / name / f"{view.image_name}.npy",
+                        image.detach().cpu().numpy())
+                preview = image
+                if name == "temperature_K":
+                    preview = (preview - field.temp_min) / (field.temp_max - field.temp_min)
+                torchvision.utils.save_image(preview.clamp(0.0, 1.0),
+                                             output_root / split / name / f"{view.image_name}.png")
+            if load2gpu_on_the_fly:
+                view.load2device("cpu")
+    print(f"[physical_fields] wrote {output_root}")
 
 
 def _is_temporal_thermal_render(gaussians, view=None):
@@ -294,9 +359,10 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
     gts_rgb_path = os.path.join(model_path, name, method_name, "gt_rgb")
     depth_path = os.path.join(model_path, name, method_name, "depth")
 
+    rgb_geometry_stage = bool(getattr(opt, "rgb_geometry_stage", False))
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
-    if any(getattr(view, "is_rgbt", False) for view in views):
+    if not rgb_geometry_stage and any(getattr(view, "is_rgbt", False) for view in views):
         makedirs(render_rgb_path, exist_ok=True)
         makedirs(gts_rgb_path, exist_ok=True)
     makedirs(depth_path, exist_ok=True)
@@ -311,7 +377,9 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
         fid = view.fid
         xyz = gaussians.get_xyz
         is_rgbt = getattr(view, "is_rgbt", False)
-        if _use_static_temporal_geometry(gaussians, view, temporal_use_view_deform):
+        stage1_rgb_view = bool(rgb_geometry_stage and is_rgbt)
+        feature_set = "rgb" if stage1_rgb_view else ("thermal" if is_rgbt else "rgb")
+        if stage1_rgb_view or _use_static_temporal_geometry(gaussians, view, temporal_use_view_deform):
             d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
         else:
             d_xyz, d_rotation, d_scaling = compute_geo_fields(
@@ -326,7 +394,7 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
                 time_interval,
                 device,
                 is_blender=True,
-                feature_set="thermal" if is_rgbt else "rgb",
+                feature_set=feature_set,
                 eval_mode=True,
             )
             d_xyz, _, _, _ = apply_temporal_pose_delta(
@@ -350,8 +418,8 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
             d_scaling,
             device,
             is_6dof,
-            override_color=_temporal_override_color(gaussians, view),
-            feature_set="thermal" if is_rgbt else "rgb",
+            override_color=None if stage1_rgb_view else _temporal_override_color(gaussians, view),
+            feature_set=feature_set,
             opacity_threshold=float(getattr(opt, "ir_eval_opacity_threshold", 0.0)) if opt is not None else 0.0,
         )
         t_end = time.time()
@@ -373,7 +441,7 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
                 device,
                 is_6dof,
                 scene_extent,
-                feature_set="thermal" if is_rgbt else "rgb",
+                feature_set=feature_set,
                 eval_temporal_interval=eval_temporal_interval,
                 temporal_affine_model=temporal_affine_model,
                 temporal_pose_model=temporal_pose_model,
@@ -387,11 +455,15 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
         depth = depth / (depth.max() + 1e-5)  # Normalize depth for visualization
 
         # Save rendered outputs
-        gt = view.original_image[0:3, :, :]  # Ground truth image
+        gt = (
+            view.original_rgb_image[0:3, :, :]
+            if stage1_rgb_view
+            else view.original_image[0:3, :, :]
+        )
         torchvision.utils.save_image(rendering, os.path.join(render_path, f'{idx:05d}.png'))
         torchvision.utils.save_image(gt, os.path.join(gts_path, f'{idx:05d}.png'))
         torchvision.utils.save_image(depth, os.path.join(depth_path, f'{idx:05d}.png'))
-        if is_rgbt and view.original_rgb_image is not None:
+        if is_rgbt and not stage1_rgb_view and view.original_rgb_image is not None:
             rgb_geo = rgb_geo_model if rgb_geo_model is not None else geo_model
             rgb_d_xyz, rgb_d_rotation, rgb_d_scaling = compute_geo_fields(
                 view,
@@ -763,6 +835,9 @@ def interpolate_view_original(model_path, load2gpt_on_the_fly, is_6dof, name, it
 def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, skip_train: bool, skip_test: bool,
                 mode: str, device, opt=None):
     with torch.no_grad():
+        rgb_geometry_stage = bool(getattr(opt, "rgb_geometry_stage", False))
+        if rgb_geometry_stage:
+            dataset.rgb_geometry_stage = True
         gaussians = GaussianModel(dataset.sh_degree, device)
         if getattr(dataset, "load_model_path", ""):
             print(
@@ -780,9 +855,10 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
             dataset.is_6dof,
             time_multires=geometry_time_multires,
         )
-        geo_model.load_weights(dataset.model_path)
+        if not rgb_geometry_stage:
+            geo_model.load_weights(dataset.model_path)
         rgb_geo_model = None
-        if getattr(scene, "has_rgbt", False):
+        if getattr(scene, "has_rgbt", False) and not rgb_geometry_stage:
             rgb_geo_model = GeoRefineModel(
                 device,
                 dataset.is_blender,
@@ -969,9 +1045,14 @@ if __name__ == "__main__":
     parser.add_argument("--temporal_residual_output_method", default="")
     parser.add_argument("--temporal_residual_no_overwrite", action="store_true")
     parser.add_argument("--keep_all_render_methods", action="store_true")
+    parser.add_argument("--prune_non_best_render_methods", action="store_true",
+                        help="Destructively remove non-best test render directories")
     parser.add_argument("--rgbt_disable_best_checkpoint_selection", action="store_true")
     parser.add_argument("--rgbt_allow_logged_checkpoint_selection", action="store_true")
     parser.add_argument("--rgbt_best_checkpoint_iteration", type=int, default=30001)
+    parser.add_argument("--thermal_checkpoint", default="",
+                        help="Thermal C/K/R checkpoint used by physical_fields mode")
+    parser.add_argument("--physical_output", default="")
     args = get_combined_args(parser, device)
     selected_rgbt_iter = _select_rgbt_best_checkpoint(args)
     if selected_rgbt_iter is not None:
@@ -982,6 +1063,8 @@ if __name__ == "__main__":
     safe_state(args.quiet, device)
 
     apply_temporal_residual = (
+        not bool(getattr(args, "rgb_geometry_stage", False))
+        and
         not args.skip_temporal_residual_postprocess
         and args.mode == "render"
         and not args.skip_test
@@ -989,6 +1072,9 @@ if __name__ == "__main__":
     if apply_temporal_residual and not args.render_train:
         print("[TRES_RENDER] enabling train rendering for automatic temporal residual postprocess.")
 
+    extracted_opt = optimization.extract(args)
+    extracted_opt.thermal_checkpoint = args.thermal_checkpoint
+    extracted_opt.physical_output = args.physical_output
     render_info = render_sets(
         model.extract(args),
         args.iteration,
@@ -997,9 +1083,10 @@ if __name__ == "__main__":
         args.skip_test,
         args.mode,
         device,
-        optimization.extract(args),
+        extracted_opt,
     )
     if apply_temporal_residual:
         _run_temporal_residual_postprocess(args, render_info)
-    if args.mode == "render" and not args.skip_test and not args.keep_all_render_methods:
+    if (args.mode == "render" and not args.skip_test and
+            args.prune_non_best_render_methods and not args.keep_all_render_methods):
         _keep_only_best_test_method(args.model_path, render_info)

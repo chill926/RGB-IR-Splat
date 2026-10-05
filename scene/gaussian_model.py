@@ -221,7 +221,9 @@ class GaussianModel:
         self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device=device)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=device)
 
-        self.spatial_lr_scale = 5
+        vanilla_rgb_stage = bool(getattr(training_args, "rgb_geometry_stage", False))
+        if not vanilla_rgb_stage:
+            self.spatial_lr_scale = 5
 
         rgb_feature_lr = training_args.feature_lr
         if self.has_thermal_branch:
@@ -232,7 +234,11 @@ class GaussianModel:
             {'params': [self._features_dc], 'lr': rgb_feature_lr, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': rgb_feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-            {'params': [self._scaling], 'lr': training_args.scaling_lr * self.spatial_lr_scale, "name": "scaling"},
+            {'params': [self._scaling], 'lr': (
+                training_args.scaling_lr
+                if vanilla_rgb_stage
+                else training_args.scaling_lr * self.spatial_lr_scale
+            ), "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
         if self.has_thermal_branch:
@@ -848,7 +854,8 @@ class GaussianModel:
                           density_guided_clone=False, density_guided_clone_scale=1.0,
                           max_new_points=0, max_total_points=0, split_first=False,
                           budget_recycle_points=0, budget_recycle_start=0.97,
-                          budget_recycle_opacity=0.25, budget_recycle_grad_factor=2.0):
+                          budget_recycle_opacity=0.25, budget_recycle_grad_factor=2.0,
+                          use_vanilla_gradient=False):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
@@ -864,7 +871,12 @@ class GaussianModel:
             "direction_weight_max": 1.0,
         }
 
-        if use_direction_aware:
+        if use_vanilla_gradient:
+            split_threshold = max_grad
+            clone_grads = grads
+            split_grads = grads
+            mode = "vanilla_3dgs"
+        elif use_direction_aware:
             split_threshold = max_grad_abs if max_grad_abs is not None else max_grad
             consistency = ((grads + 1e-8) / (grads_abs + 1e-8)).clamp(0.0, 1.0)
             direction_weight = float(direction_aware_base) + float(direction_aware_scale) * torch.pow(
@@ -916,7 +928,10 @@ class GaussianModel:
             grads[grads.isnan()] = 0.0
             grads_abs = self.xyz_gradient_accum_abs / self.denom
             grads_abs[grads_abs.isnan()] = 0.0
-            if use_direction_aware:
+            if use_vanilla_gradient:
+                clone_grads = grads
+                split_grads = grads
+            elif use_direction_aware:
                 consistency = ((grads + 1e-8) / (grads_abs + 1e-8)).clamp(0.0, 1.0)
                 direction_weight = float(direction_aware_base) + float(direction_aware_scale) * torch.pow(
                     1.0 - consistency, float(direction_aware_power)

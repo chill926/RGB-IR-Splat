@@ -7,7 +7,7 @@ import torch
 
 
 def last_records(path):
-    training = evaluation = None
+    training = evaluation = test = None
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             record = json.loads(line)
@@ -15,9 +15,13 @@ def last_records(path):
                 training = record
             if "validation_radiance_loss" in record:
                 evaluation = record
+            if "final_test_radiance_loss" in record:
+                test = record
     if training is None or evaluation is None:
         raise RuntimeError(f"Incomplete branch log: {path}")
-    return training, evaluation
+    if test is None:
+        raise RuntimeError(f"No final-only test record in {path}")
+    return training, evaluation, test
 
 
 def main():
@@ -41,20 +45,20 @@ def main():
         if common_step is not None and (step != common_step or seed != common_seed):
             raise RuntimeError("C/K/R final update counts or random seeds differ")
         common_step, common_seed = step, seed
-        training, evaluation = last_records(branch_root / "thermal_training.jsonl")
+        training, evaluation, test = last_records(branch_root / "thermal_training.jsonl")
         rows[branch] = {
             "updates": step, "seed": seed,
             "training_loss": training["loss"],
             "training_radiance_loss": training["radiance_loss"],
             "validation_radiance_loss": evaluation["validation_radiance_loss"],
+            "final_test_radiance_loss": test["final_test_radiance_loss"],
             "temperature_mae_K": training.get("temperature_mae_K"),
             "temperature_rmse_K": training.get("temperature_rmse_K"),
             "temperature_semantics": training.get("temperature_semantics"),
             "parameters_stable": evaluation.get("parameters_stable"),
             "material_parameter_update": evaluation.get("material_parameter_update"),
-            "k_nonmetal": training.get("k_nonmetal"), "k_metal": training.get("k_metal"),
-            "delta_epsilon_nonmetal": training.get("delta_epsilon_nonmetal"),
-            "delta_epsilon_metal": training.get("delta_epsilon_metal"),
+            "k_by_material": training.get("k_by_material"),
+            "delta_epsilon_by_material": training.get("delta_epsilon_by_material"),
         }
     report = {"comparison_protocol_sha256": protocol_hash, "branches": rows}
     output = Path(args.output)

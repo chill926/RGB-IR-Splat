@@ -21,7 +21,6 @@ def main():
     parser.add_argument("--geometry_model", required=True)
     parser.add_argument("--geometry_iteration", type=int, default=-1)
     parser.add_argument("--steps", type=int, default=5000)
-    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--feature_lr", type=float, default=0.0025)
     parser.add_argument("--lambda_dssim", type=float, default=0.2)
     args = parser.parse_args()

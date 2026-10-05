@@ -1,0 +1,65 @@
+{
+  "format_version": 1,
+  "spectral_band": "8-14 um approximation; verify against the actual camera response",
+  "temperature_reference_K": 300.0,
+  "unknown_label": 255,
+  "unknown_epsilon0": 0.95,
+  "materials": [
+    {
+      "id": 0,
+      "name": "paint",
+      "epsilon0": 0.93,
+      "epsilon0_candidate_range": [0.92, 0.94],
+      "surface_condition": "visually confirmed vehicle paint; choose matte/gloss condition",
+      "source": "https://support.flir.com/DSDownload/Assets/T810442-en-US_A4.pdf",
+      "confirmed": false,
+      "learn_k": true,
+      "learn_delta": true,
+      "k_prior": 0.0,
+      "sigma_k": 0.0001,
+      "sigma_delta": 0.05
+    },
+    {
+      "id": 1,
+      "name": "rubber",
+      "epsilon0": 0.95,
+      "epsilon0_candidate_range": [0.93, 0.97],
+      "surface_condition": "hard or rough tire rubber",
+      "source": "https://support.flir.com/DSDownload/Assets/T810442-en-US_A4.pdf",
+      "confirmed": false,
+      "learn_k": true,
+      "learn_delta": true,
+      "k_prior": 0.0,
+      "sigma_k": 0.0001,
+      "sigma_delta": 0.05
+    },
+    {
+      "id": 2,
+      "name": "glass",
+      "epsilon0": 0.97,
+      "epsilon0_candidate_range": [0.94, 0.97],
+      "surface_condition": "uncoated float-glass approximation; reflective/angle-sensitive",
+      "source": "https://support.flir.com/DSDownload/Assets/T810442-en-US_A4.pdf",
+      "confirmed": false,
+      "learn_k": false,
+      "learn_delta": false,
+      "k_prior": 0.0,
+      "sigma_k": 0.0001,
+      "sigma_delta": 0.05
+    },
+    {
+      "id": 3,
+      "name": "asphalt",
+      "epsilon0": 0.967,
+      "epsilon0_candidate_range": [0.95, 0.98],
+      "surface_condition": "asphalt paving; include only if it is a major visible background surface",
+      "source": "https://support.flir.com/DSDownload/Assets/T810442-en-US_A4.pdf",
+      "confirmed": false,
+      "learn_k": false,
+      "learn_delta": false,
+      "k_prior": 0.0,
+      "sigma_k": 0.0001,
+      "sigma_delta": 0.05
+    }
+  ]
+}

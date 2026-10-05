@@ -37,7 +37,7 @@ def readImages(renders_dir, gt_dir):
     return renders, gts, image_names
 
 
-def evaluate(model_paths, keep_all_methods=False):
+def evaluate(model_paths, prune_non_best=False):
     full_dict = {}
     per_view_dict = {}
     full_dict_polytopeonly = {}
@@ -80,9 +80,9 @@ def evaluate(model_paths, keep_all_methods=False):
                     psnrs.append(psnr(renders[idx], gts[idx]))
                     lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
 
-                print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
-                print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
-                print("  LPIPS: {:>12.7f}".format(torch.tensor(lpipss).mean(), ".5"))
+                print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean()))
+                print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean()))
+                print("  LPIPS: {:>12.7f}".format(torch.tensor(lpipss).mean()))
                 print("")
 
                 scene_full[method].update({"SSIM": torch.tensor(ssims).mean().item(),
@@ -93,7 +93,7 @@ def evaluate(model_paths, keep_all_methods=False):
                      "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
                      "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)}})
 
-            if scene_full and not keep_all_methods:
+            if scene_full and prune_non_best:
                 best_method = max(scene_full, key=lambda name: scene_full[name]["PSNR"])
                 removed = []
                 for method in scene_full:
@@ -131,6 +131,7 @@ if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument('--model_paths', '-m', required=True, nargs="+", type=str, default=[])
-    parser.add_argument('--keep_all_methods', action="store_true")
+    parser.add_argument('--prune_non_best', action="store_true",
+                        help="Destructively delete rendered methods except the best PSNR result")
     args = parser.parse_args()
-    evaluate(args.model_paths, keep_all_methods=args.keep_all_methods)
+    evaluate(args.model_paths, prune_non_best=args.prune_non_best)

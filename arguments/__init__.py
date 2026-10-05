@@ -60,6 +60,11 @@ class ModelParams(ParamGroup):
         self.data_branch = "auto"
         self.load_iteration = 0
         self.load_model_path = ""
+        # Controls the Python/NumPy/Torch generators only. The rasteriser's
+        # CUDA backward pass accumulates gradients with atomicAdd, whose
+        # ordering is not deterministic, so runs are still not bit-reproducible
+        # at the same seed. Vary this to get error bars, not exact repeats.
+        self.seed = 0
         self.load2gpu_on_the_fly = False
         self.load_sparse_depth = False
         self.is_blender = False
@@ -118,9 +123,6 @@ class OptimizationParams(ParamGroup):
         # geometry and RGB SH (f_dc/f_rest). Thermal appearance and all thermal-
         # physics variables are excluded; later stages freeze the stage-1 state.
         self.rgb_geometry_stage = False
-        self.rgb_geometry_early_stop_patience = 5
-        self.rgb_geometry_early_stop_min_delta = 0.01
-        self.rgb_geometry_stability_tol = 1e-4
         self.opacity_lr = 0.05
         self.scaling_lr = 0.001
         self.rotation_lr = 0.001

@@ -60,8 +60,6 @@ def main():
     parser.add_argument("--lambda_delta_grid", default="1e-5,1e-4,1e-3")
     parser.add_argument("--seeds", default="0,1,2")
     parser.add_argument("--steps", type=int, default=2000)
-    parser.add_argument("--k_warmup_steps", type=int, default=500,
-                        help="Nk fixed by this protocol for every later scene")
     args = parser.parse_args()
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -80,7 +78,7 @@ def main():
                     "--eval",
                     "--stage", "branch", "--branch", branch, "--geometry_model", args.geometry_model,
                     "--stage2_checkpoint", args.stage2_checkpoint, "--steps", str(args.steps),
-                    "--seed", str(seed), "--k_warmup_steps", str(args.k_warmup_steps),
+                    "--seed", str(seed),
                     option, str(regularization), "--regularization_scan_run"]
                 subprocess.run(command, check=True)
                 metrics = final_validation_metrics(run_dir / "thermal_training.jsonl")
@@ -101,10 +99,10 @@ def main():
                 "temperature_mae_std_K": statistics.pstdev(temperature_mae),
                 "validation_mean": statistics.mean(radiance_losses),
                 "validation_std": statistics.pstdev(radiance_losses), "seeds": ints(args.seeds),
-                "parameter_nonmetal_mean": statistics.mean(row[0] for row in parameters),
-                "parameter_nonmetal_std": statistics.pstdev(row[0] for row in parameters),
-                "parameter_metal_mean": statistics.mean(row[1] for row in parameters),
-                "parameter_metal_std": statistics.pstdev(row[1] for row in parameters)})
+                "parameter_mean_by_id": [statistics.mean(row[idx] for row in parameters)
+                                         for idx in range(len(parameters[0]))],
+                "parameter_std_by_id": [statistics.pstdev(row[idx] for row in parameters)
+                                        for idx in range(len(parameters[0]))]})
     selected = {}
     for branch in ("K", "R"):
         selected[branch] = min(
@@ -113,7 +111,6 @@ def main():
         )
     report = {"selection_dataset_role": "synthetic_validation",
               "source": os.path.abspath(args.source),
-              "k_warmup_steps": args.k_warmup_steps,
               "selection_metric": "final_temperature_rmse_K_then_validation_radiance_loss",
               "results": results, "selected": selected,
               "instruction": "Freeze these selected values for every subsequent test scene."}

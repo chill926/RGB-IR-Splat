@@ -129,6 +129,11 @@ def _image_name_to_time(image_name: str, idx: int, num_frames: int, frame_index_
 
 def _thermal_to_gray_rgb(image: Image.Image) -> np.ndarray:
     """Return normalized float RGB while preserving integer thermal bit depth."""
+    if image.mode == "P":
+        raise ValueError(
+            "Palette thermal image detected. Palette indices are not radiometric values; "
+            "export a single-channel raw/temperature image."
+        )
     array = np.asarray(image)
     if array.ndim not in (2, 3):
         raise ValueError(f"Unsupported thermal image shape: {array.shape}")
@@ -144,11 +149,18 @@ def _thermal_to_gray_rgb(image: Image.Image) -> np.ndarray:
     else:
         raise ValueError(f"Unsupported thermal image dtype: {array.dtype}")
     if normalized.ndim == 3:
-        if normalized.shape[2] < 3:
+        if normalized.shape[2] == 1:
             gray = normalized[..., 0]
         else:
-            gray = (0.299 * normalized[..., 0] + 0.587 * normalized[..., 1]
-                    + 0.114 * normalized[..., 2])
+            channels = normalized[..., :3]
+            if not np.allclose(channels[..., 0], channels[..., 1], atol=1e-6) or not np.allclose(
+                    channels[..., 0], channels[..., 2], atol=1e-6):
+                raise ValueError(
+                    "Color thermal image detected. Pseudocolor is not a radiometric observation; "
+                    "export a single-channel raw/temperature image or explicitly preprocess it "
+                    "with a documented calibration."
+                )
+            gray = channels[..., 0]
     else:
         gray = normalized
     return np.repeat(gray[..., None], 3, axis=2).astype(np.float32, copy=False)
@@ -300,7 +312,13 @@ def readRGBTCameras(cam_extrinsics, cam_intrinsics, rgb_folder, thermal_folder):
         basename = os.path.basename(extr.name)
         rgb_path = os.path.join(rgb_folder, basename)
         thermal_path = os.path.join(thermal_folder, basename)
-        if not (os.path.exists(rgb_path) and os.path.exists(thermal_path)):
+        rgb_exists, thermal_exists = os.path.exists(rgb_path), os.path.exists(thermal_path)
+        if rgb_exists != thermal_exists:
+            raise FileNotFoundError(
+                f"Incomplete RGBT pair for {basename}: rgb_exists={rgb_exists}, "
+                f"thermal_exists={thermal_exists}"
+            )
+        if not rgb_exists:
             continue
 
         rgb_image = Image.open(rgb_path).convert("RGB")

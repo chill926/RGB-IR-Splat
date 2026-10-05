@@ -73,23 +73,39 @@ class UniformLWIRPlanckLUT(nn.Module):
 
 
 class MaterialThermalField(nn.Module):
-    """Per-Gaussian T/E and material-shared emissivity parameters."""
+    """Per-Gaussian temperature with global environment and material parameters.
+
+    ``material_ids == -1`` denotes an unknown/ambiguous material. Unknown
+    Gaussians still receive a fixed fallback emissivity, but never update a
+    material-shared K/R parameter.
+    """
     BRANCHES = ("stage2", "C", "K", "R")
 
-    def __init__(self, material_ids, initial_radiance, branch="stage2", temp_min=250.0,
-                 temp_max=450.0, temp_ref=300.0, epsilon_metal=0.3,
-                 epsilon_nonmetal=0.9, k_max=0.001, delta_epsilon_max=0.2,
+    def __init__(self, material_ids, initial_radiance, epsilon0_by_material,
+                 material_names=None, material_confidence=None,
+                 learn_k_by_material=None, learn_delta_by_material=None,
+                 k_prior_by_material=None, sigma_k_by_material=None,
+                 sigma_delta_by_material=None, unknown_epsilon0=0.95,
+                 branch="stage2", temp_min=250.0, temp_max=450.0,
+                 temp_ref=300.0, k_max=0.001, delta_epsilon_max=0.2,
                  initial_environment=None):
         super().__init__()
         if branch not in self.BRANCHES:
             raise ValueError("branch must be one of: " + ", ".join(self.BRANCHES))
         material_ids = material_ids.reshape(-1).long()
-        if material_ids.numel() and (int(material_ids.min()) < 0 or int(material_ids.max()) > 1):
-            raise ValueError("The simplified material prior accepts only 0=non-metal and 1=metal")
+        epsilon0_by_material = torch.as_tensor(epsilon0_by_material, dtype=torch.float32).reshape(-1)
+        if epsilon0_by_material.numel() < 1:
+            raise ValueError("At least one material must be defined")
+        if material_ids.numel() and int(material_ids.max()) >= epsilon0_by_material.numel():
+            raise ValueError("material_ids contains an id absent from epsilon0_by_material")
+        if material_ids.numel() and int(material_ids.min()) < -1:
+            raise ValueError("Only -1 may be used as the unknown material id")
         if not float(temp_min) < float(temp_ref) < float(temp_max):
             raise ValueError("Temperature bounds must satisfy temp_min < temp_ref < temp_max")
-        if not (0.01 <= float(epsilon_metal) < float(epsilon_nonmetal) <= 0.99):
-            raise ValueError("Binary emissivity anchors must satisfy 0.01 <= metal < non-metal <= 0.99")
+        if not bool(((epsilon0_by_material >= 0.01) & (epsilon0_by_material <= 0.99)).all()):
+            raise ValueError("Every fixed epsilon_0 must lie in [0.01, 0.99]")
+        if not 0.01 <= float(unknown_epsilon0) <= 0.99:
+            raise ValueError("unknown_epsilon0 must lie in [0.01, 0.99]")
         if float(k_max) <= 0.0 or float(delta_epsilon_max) <= 0.0:
             raise ValueError("Material parameter bounds must be positive")
         initial_radiance = initial_radiance.reshape(-1, 1).clamp(1e-4, 1 - 1e-4)
@@ -98,17 +114,40 @@ class MaterialThermalField(nn.Module):
         self.branch = branch
         self.temp_min, self.temp_max, self.temp_ref = float(temp_min), float(temp_max), float(temp_ref)
         self.k_max, self.delta_epsilon_max = float(k_max), float(delta_epsilon_max)
+        self.material_names = list(material_names or [f"material_{idx}" for idx in range(epsilon0_by_material.numel())])
+        if len(self.material_names) != epsilon0_by_material.numel():
+            raise ValueError("material_names and epsilon0_by_material must have equal length")
+        self.unknown_epsilon0 = float(unknown_epsilon0)
         self.register_buffer("material_ids", material_ids)
-        self.register_buffer("epsilon0_by_material", torch.tensor([epsilon_nonmetal, epsilon_metal], dtype=torch.float32))
+        self.register_buffer("material_valid", material_ids >= 0)
+        confidence = (torch.ones_like(material_ids, dtype=torch.float32) if material_confidence is None
+                      else torch.as_tensor(material_confidence, dtype=torch.float32).reshape(-1))
+        if confidence.shape != material_ids.shape:
+            raise ValueError("material_confidence and material_ids must have equal length")
+        self.register_buffer("material_confidence", confidence.clamp(0.0, 1.0))
+        self.register_buffer("epsilon0_by_material", epsilon0_by_material)
+        count = epsilon0_by_material.numel()
+        def material_vector(value, default, dtype=torch.float32):
+            tensor = torch.full((count,), default, dtype=dtype) if value is None else torch.as_tensor(value, dtype=dtype).reshape(-1)
+            if tensor.numel() != count:
+                raise ValueError("Every material parameter vector must match epsilon0_by_material")
+            return tensor
+        self.register_buffer("learn_k_by_material", material_vector(learn_k_by_material, True, torch.bool))
+        self.register_buffer("learn_delta_by_material", material_vector(learn_delta_by_material, True, torch.bool))
+        self.register_buffer("k_prior_by_material", material_vector(k_prior_by_material, 0.0))
+        self.register_buffer("sigma_k_by_material", material_vector(sigma_k_by_material, 1e-4).clamp_min(1e-12))
+        self.register_buffer("sigma_delta_by_material", material_vector(sigma_delta_by_material, 0.05).clamp_min(1e-12))
         self.temperature_raw = nn.Parameter(torch.logit(initial_radiance))
         ambient = (float(torch.quantile(initial_radiance.detach(), 0.25))
                    if initial_environment is None else float(initial_environment))
         if not 0.0 < ambient < 1.0:
             raise ValueError("Initial environment irradiance must lie strictly inside (0, 1)")
         ambient_raw = math.log(max(ambient, 1e-4) / max(1 - ambient, 1e-4))
-        self.environment_raw = nn.Parameter(torch.full_like(initial_radiance, ambient_raw))
-        self.k_raw = nn.Parameter(torch.zeros(2))
-        self.delta_epsilon_raw = nn.Parameter(torch.zeros(2))
+        # The first model deliberately uses one environment radiance for the
+        # complete scene. It is not indexed by Gaussian or material.
+        self.environment_raw = nn.Parameter(initial_radiance.new_tensor([ambient_raw]))
+        self.k_raw = nn.Parameter(torch.zeros(count, device=initial_radiance.device))
+        self.delta_epsilon_raw = nn.Parameter(torch.zeros(count, device=initial_radiance.device))
 
     @property
     def temperature(self):
@@ -120,19 +159,29 @@ class MaterialThermalField(nn.Module):
 
     @property
     def k_epsilon_by_material(self):
-        return self.k_max * torch.tanh(self.k_raw)
+        return self.k_max * torch.tanh(self.k_raw) * self.learn_k_by_material.to(self.k_raw)
 
     @property
     def delta_epsilon_by_material(self):
-        return self.delta_epsilon_max * torch.tanh(self.delta_epsilon_raw)
+        return (self.delta_epsilon_max * torch.tanh(self.delta_epsilon_raw) *
+                self.learn_delta_by_material.to(self.delta_epsilon_raw))
+
+    def base_emissivity(self):
+        safe_ids = self.material_ids.clamp_min(0)
+        known = self.epsilon0_by_material[safe_ids, None]
+        fallback = known.new_full(known.shape, self.unknown_epsilon0)
+        return torch.where(self.material_valid[:, None], known, fallback)
 
     def emissivity(self):
-        epsilon0 = self.epsilon0_by_material[self.material_ids, None]
+        epsilon0 = self.base_emissivity()
+        safe_ids = self.material_ids.clamp_min(0)
         if self.branch == "K":
-            k = self.k_epsilon_by_material[self.material_ids, None]
+            k = self.k_epsilon_by_material[safe_ids, None]
+            k = torch.where(self.material_valid[:, None], k, torch.zeros_like(k))
             return (epsilon0 + k * (self.temperature - self.temp_ref)).clamp(0.01, 0.99)
         if self.branch == "R":
-            delta = self.delta_epsilon_by_material[self.material_ids, None]
+            delta = self.delta_epsilon_by_material[safe_ids, None]
+            delta = torch.where(self.material_valid[:, None], delta, torch.zeros_like(delta))
             return (epsilon0 + delta).clamp(0.01, 0.99)
         return epsilon0
 
@@ -140,43 +189,82 @@ class MaterialThermalField(nn.Module):
         emission, epsilon = planck_lut(self.temperature), self.emissivity()
         return epsilon * emission + (1 - epsilon) * self.environment
 
-    def branch_regularizer(self, sigma_k=(0.001, 0.001), sigma_delta=(0.05, 0.05),
-                           k_prior=(0.0, 0.0), delta=1e-12):
+    def branch_regularizer(self, delta=1e-12):
         if self.branch == "K":
-            sigma = self.k_raw.new_tensor(sigma_k).clamp_min(1e-12)
-            prior = self.k_raw.new_tensor(k_prior)
-            return ((self.k_epsilon_by_material - prior).square() /
-                    (sigma.square() + float(delta))).sum()
+            mask = self.learn_k_by_material
+            return (((self.k_epsilon_by_material[mask] - self.k_prior_by_material[mask]).square()) /
+                    (self.sigma_k_by_material[mask].square() + float(delta))).sum()
         if self.branch == "R":
-            sigma = self.delta_epsilon_raw.new_tensor(sigma_delta).clamp_min(1e-12)
-            return (self.delta_epsilon_by_material.square() /
-                    (sigma.square() + float(delta))).sum()
+            mask = self.learn_delta_by_material
+            return (self.delta_epsilon_by_material[mask].square() /
+                    (self.sigma_delta_by_material[mask].square() + float(delta))).sum()
         return self.temperature_raw.new_zeros(())
 
-    def set_warmup_trainability(self, warmup):
-        self.temperature_raw.requires_grad_(not warmup)
-        self.environment_raw.requires_grad_(not warmup)
+    def set_branch_trainability(self):
+        self.temperature_raw.requires_grad_(True)
+        self.environment_raw.requires_grad_(True)
         self.k_raw.requires_grad_(self.branch == "K")
         self.delta_epsilon_raw.requires_grad_(self.branch == "R")
 
+    @torch.no_grad()
+    def apply_identifiability_gate(self, min_gaussians=100, min_temperature_std=1.0,
+                                   min_temperature_range=5.0):
+        """Disable K and matched R parameters without enough material support."""
+        rows = []
+        for material_id, name in enumerate(self.material_names):
+            selected = self.material_valid & (self.material_ids == material_id)
+            count = int(selected.sum())
+            values = self.temperature[selected, 0]
+            std = float(values.std(unbiased=False)) if count else 0.0
+            span = float(values.max() - values.min()) if count else 0.0
+            identifiable = (count >= int(min_gaussians) and std >= float(min_temperature_std)
+                            and span >= float(min_temperature_range))
+            self.learn_k_by_material[material_id] &= identifiable
+            # R keeps exactly the same enabled material parameter count as K.
+            self.learn_delta_by_material[material_id] &= identifiable
+            rows.append({"id": material_id, "name": name, "gaussians": count,
+                         "temperature_std_K": std, "temperature_range_K": span,
+                         "identifiable": bool(identifiable)})
+        return rows
+
     def export_state(self):
-        return {"format_version": 2, "branch": self.branch,
+        return {"format_version": 3, "branch": self.branch,
                 "config": {"temp_min": self.temp_min, "temp_max": self.temp_max, "temp_ref": self.temp_ref,
                            "k_max": self.k_max, "delta_epsilon_max": self.delta_epsilon_max,
-                           "epsilon_nonmetal": float(self.epsilon0_by_material[0]),
-                           "epsilon_metal": float(self.epsilon0_by_material[1])},
+                           "material_names": self.material_names,
+                           "unknown_epsilon0": self.unknown_epsilon0},
                 "state_dict": self.state_dict()}
 
     @classmethod
-    def from_checkpoint(cls, checkpoint, branch, device):
+    def from_checkpoint(cls, checkpoint, branch, device, reset_branch_parameters=True):
         state = checkpoint["state_dict"]
-        model = cls(state["material_ids"].to(device), torch.sigmoid(state["temperature_raw"]).to(device),
-                    branch=branch, initial_environment=float(torch.sigmoid(state["environment_raw"]).mean()),
-                    **checkpoint["config"]).to(device)
-        model.load_state_dict({k: v.to(device) for k, v in state.items()}, strict=False)
+        config = checkpoint["config"]
+        epsilon0 = state.get("epsilon0_by_material")
+        if epsilon0 is None:
+            epsilon0 = torch.tensor([config["epsilon_nonmetal"], config["epsilon_metal"]])
+        model = cls(
+            state["material_ids"].to(device), torch.sigmoid(state["temperature_raw"]).to(device),
+            epsilon0_by_material=epsilon0.to(device),
+            material_names=config.get("material_names"),
+            material_confidence=state.get("material_confidence"),
+            learn_k_by_material=state.get("learn_k_by_material"),
+            learn_delta_by_material=state.get("learn_delta_by_material"),
+            k_prior_by_material=state.get("k_prior_by_material"),
+            sigma_k_by_material=state.get("sigma_k_by_material"),
+            sigma_delta_by_material=state.get("sigma_delta_by_material"),
+            unknown_epsilon0=config.get("unknown_epsilon0", float(epsilon0[0])),
+            branch=branch, initial_environment=float(torch.sigmoid(state["environment_raw"]).mean()),
+            temp_min=config["temp_min"], temp_max=config["temp_max"], temp_ref=config["temp_ref"],
+            k_max=config["k_max"], delta_epsilon_max=config["delta_epsilon_max"],
+        ).to(device)
+        compatible = {key: value.to(device) for key, value in state.items()
+                      if key in model.state_dict() and model.state_dict()[key].shape == value.shape}
+        model.load_state_dict(compatible, strict=False)
         model.branch = branch
-        model.k_raw.data.zero_()
-        model.delta_epsilon_raw.data.zero_()
+        if reset_branch_parameters:
+            model.k_raw.data.zero_()
+            model.delta_epsilon_raw.data.zero_()
+        model.set_branch_trainability()
         return model
 
 
@@ -285,12 +373,19 @@ def map_thermal_observations_to_gaussians(gaussians, cameras, observation_transf
 
 
 @torch.no_grad()
-def map_metal_masks_to_gaussians(gaussians, cameras, mask_root, vote_threshold=0.5,
-                                 allow_missing=False, visibility_provider=None):
-    """Project binary SAM2 metal masks and average their per-view probabilities."""
+def map_material_masks_to_gaussians(gaussians, cameras, mask_root, num_materials,
+                                    unknown_label=255, confidence_threshold=0.6,
+                                    margin_threshold=0.15, allow_missing=False,
+                                    visibility_provider=None):
+    """Fuse multi-class material masks into confidence-filtered Gaussian labels.
+
+    Masks contain integer material ids in ``[0, num_materials)`` and
+    ``unknown_label`` for ambiguous pixels. Unknown and unseen Gaussians remain
+    unknown; they are deliberately not filled by nearest-neighbour propagation.
+    """
     device = gaussians.get_xyz.device
     weight_sum = torch.zeros(gaussians.get_xyz.shape[0], device=device)
-    probability = torch.zeros_like(weight_sum)
+    class_votes = torch.zeros((int(num_materials), weight_sum.numel()), device=device)
     used = 0
     missing = []
     for camera in cameras:
@@ -298,44 +393,75 @@ def map_metal_masks_to_gaussians(gaussians, cameras, mask_root, vote_threshold=0
         if mask_path is None:
             missing.append(camera.image_name)
             continue
-        mask = torch.from_numpy(np.asarray(Image.open(mask_path).convert("L"), dtype=np.float32) / 255).to(device)[None, None]
+        mask_array = np.asarray(Image.open(mask_path))
+        if mask_array.ndim != 2:
+            raise ValueError(f"Material mask must be a single-channel label image: {mask_path}")
+        invalid = ~((mask_array >= 0) & (mask_array < int(num_materials)) | (mask_array == int(unknown_label)))
+        if invalid.any():
+            values = np.unique(mask_array[invalid])[:8].tolist()
+            raise ValueError(f"Material mask {mask_path} contains invalid labels: {values}")
+        labels = torch.from_numpy(mask_array.astype(np.int64, copy=False)).to(device)
+        planes = torch.stack([(labels == material_id).float() for material_id in range(int(num_materials))])
+        confidence_path = mask_path.with_name(mask_path.stem + ".confidence.npy")
+        if confidence_path.exists():
+            pixel_confidence = np.load(confidence_path, allow_pickle=False)
+            if pixel_confidence.shape != mask_array.shape or not np.isfinite(pixel_confidence).all():
+                raise ValueError(f"Invalid material confidence map: {confidence_path}")
+            confidence_image = torch.from_numpy(pixel_confidence.astype(np.float32, copy=False)).to(device)
+            planes = planes * confidence_image.clamp(0.0, 1.0)[None]
         visibility_payload = visibility_provider(camera) if visibility_provider is not None else None
         raster_visibility, projection_weight = _visibility_and_projection_weight(
             gaussians, visibility_payload)
         ndc, valid = _project_gaussians(gaussians, camera, raster_visibility=raster_visibility)
-        sampled = F.grid_sample(mask, ndc[:, :2].reshape(1, -1, 1, 2), mode="bilinear",
-                                padding_mode="zeros", align_corners=False).reshape(-1)
-        valid_weight = projection_weight[valid]
-        probability[valid] += sampled[valid] * valid_weight
-        weight_sum[valid] += valid_weight
+        sampled = F.grid_sample(planes[None], ndc[:, :2].reshape(1, -1, 1, 2), mode="bilinear",
+                                padding_mode="zeros", align_corners=False).reshape(int(num_materials), -1)
+        class_votes[:, valid] += sampled[:, valid] * projection_weight[valid][None]
+        # Keep unknown/low-confidence support in the denominator so SAM score
+        # and cross-view agreement both affect the final confidence.
+        weight_sum[valid] += projection_weight[valid]
         used += 1
     if missing and not allow_missing:
         preview = ", ".join(str(name) for name in missing[:8])
         raise RuntimeError(
-            f"Missing metal/non-metal masks for {len(missing)}/{len(cameras)} training views "
-            f"({preview}). Formal multi-view voting requires one binary mask per view."
+            f"Missing material masks for {len(missing)}/{len(cameras)} training views "
+            f"({preview}). Formal multi-view voting requires one label mask per view."
         )
     if used == 0:
-        print("[material][SMOKE-TEST ONLY] No masks found; all Gaussians use non-metal epsilon_0=0.9.")
-        return torch.zeros(gaussians.get_xyz.shape[0], dtype=torch.long, device=device)
+        if not allow_missing:
+            raise RuntimeError("No material masks were found")
+        print("[material][SMOKE-TEST ONLY] No masks found; every Gaussian is unknown.")
+        count = gaussians.get_xyz.shape[0]
+        return (torch.full((count,), -1, dtype=torch.long, device=device),
+                torch.zeros(count, device=device))
     if missing:
         print(f"[material][SMOKE-TEST ONLY] Ignored {len(missing)} views without masks.")
     observed = weight_sum > 0
     if not observed.any():
-        raise RuntimeError("Metal masks were loaded, but no Gaussian received a visible mask vote")
-    labels = torch.zeros(gaussians.get_xyz.shape[0], dtype=torch.long, device=device)
-    labels[observed] = (probability[observed] / weight_sum[observed] >= float(vote_threshold)).long()
-    unseen = ~observed
-    if unseen.any():
-        points = gaussians.get_xyz.detach().cpu().numpy()
-        observed_index = observed.nonzero(as_tuple=True)[0].cpu().numpy()
-        unseen_index = unseen.nonzero(as_tuple=True)[0].cpu().numpy()
-        nearest = cKDTree(points[observed_index]).query(points[unseen_index], k=1)[1]
-        propagated = labels[torch.from_numpy(observed_index[nearest]).to(device)]
-        labels[torch.from_numpy(unseen_index).to(device)] = propagated
-        print(f"[material] Propagated nearest observed material to {int(unseen.sum())} unseen Gaussians.")
-    print(f"[material] Used {used} masks; metal Gaussians: {int(labels.sum())}/{labels.numel()}")
-    return labels
+        raise RuntimeError("Material masks were loaded, but no Gaussian received a projected mask sample")
+    if float(class_votes.sum()) <= 0.0 and not allow_missing:
+        raise RuntimeError("Material masks contain no known-material support on visible Gaussians")
+    probabilities = class_votes / weight_sum.clamp_min(1e-12)[None]
+    confidence, winner = probabilities.max(dim=0)
+    if int(num_materials) > 1:
+        top2 = probabilities.topk(k=2, dim=0).values
+        margin = top2[0] - top2[1]
+    else:
+        margin = confidence
+    accepted = (observed & (confidence >= float(confidence_threshold)) &
+                (margin >= float(margin_threshold)))
+    assignment = torch.full_like(winner, -1)
+    assignment[accepted] = winner[accepted]
+    counts = {idx: int((assignment == idx).sum()) for idx in range(int(num_materials))}
+    print(f"[material] Used {used} masks; accepted={int(accepted.sum())}/{assignment.numel()}, "
+          f"unknown={int((~accepted).sum())}, counts={counts}")
+    return assignment, confidence
+
+
+def map_metal_masks_to_gaussians(*args, **kwargs):
+    raise RuntimeError(
+        "Binary metal/non-metal mapping was removed. Use map_material_masks_to_gaussians "
+        "with multi-class label masks and a material configuration file."
+    )
 
 
 def frozen_geometry_state(gaussians):

@@ -21,7 +21,17 @@ WARNED = False
 
 
 def loadCam(args, id, cam_info, resolution_scale):
-    orig_w, orig_h = cam_info.image.size
+    resolution_image = cam_info.image
+    if (
+        getattr(args, "rgb_geometry_stage", False)
+        and getattr(cam_info, "is_rgbt", False)
+        and getattr(cam_info, "rgb_image", None) is not None
+    ):
+        # Stage 1 follows the RGB camera resolution used by the original 3DGS
+        # branch. Both paired observations are resized to that common size so
+        # the shared Camera object keeps consistent render dimensions.
+        resolution_image = cam_info.rgb_image
+    orig_w, orig_h = resolution_image.size
 
     if args.resolution in [1, 2, 4, 8]:
         resolution = round(orig_w / (resolution_scale * args.resolution)), round(

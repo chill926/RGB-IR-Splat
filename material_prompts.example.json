@@ -1,11 +1,22 @@
 {
-  "000001": {
-    "objects": [
-      {
-        "box": [120, 80, 420, 360],
-        "positive_points": [[250, 180]],
-        "negative_points": [[80, 60]]
-      }
-    ]
+  "frames": {
+    "000001": {
+      "objects": [
+        {
+          "object_id": 1,
+          "material": "paint",
+          "box": [120, 80, 420, 360],
+          "positive_points": [[250, 180]],
+          "negative_points": [[80, 60]]
+        },
+        {
+          "object_id": 2,
+          "material": "rubber",
+          "box": [130, 300, 220, 390],
+          "positive_points": [[175, 345]],
+          "negative_points": []
+        }
+      ]
+    }
   }
 }
