@@ -21,10 +21,13 @@ from tqdm import tqdm
 
 from arguments import ModelParams, PipelineParams
 from gaussian_renderer import render
+from utils.thermal_opacity import IROpacityCorrection
 from scene import GaussianModel, Scene
 from utils.loss_utils import ssim
+from utils.thermal_training_utils import thermal_data_loss, held_lr
+from utils.thermal_observations import prepare_thermal_input, radiometric_image_errors
 from utils.thermal_physics import (
-    MaterialThermalField, UniformLWIRPlanckLUT, verify_frozen_geometry_state,
+    MaterialThermalField, verify_frozen_geometry_state,
 )
 
 
@@ -84,11 +87,11 @@ def target_image(camera, device):
     return target
 
 
-def prediction_image(camera, gray, gaussians, pipe, background, dataset, device):
+def prediction_image(camera, gray, gaussians, pipe, background, dataset, device, override_opacity=None):
     prediction = render(
         camera, gaussians, pipe, background, 0.0, 0.0, 0.0, device,
         dataset.is_6dof, override_color=gray.repeat(1, 3),
-        detach_geometry=True)["render"][:1]
+        detach_geometry=True, override_opacity=override_opacity)["render"][:1]
     if not bool(torch.isfinite(prediction).all()):
         raise FloatingPointError("Non-finite prediction: " + camera.image_name)
     return prediction
@@ -96,15 +99,15 @@ def prediction_image(camera, gray, gaussians, pipe, background, dataset, device)
 
 @torch.no_grad()
 def evaluate(views, gray, gaussians, pipe, background, dataset, device, beta,
-             directory=None, save_images=False):
+             directory=None, save_images=False, radiometric_response=None, loss_config=None, override_opacity=None):
     if directory is not None:
         directory.mkdir(parents=True, exist_ok=True)
         if save_images:
-            for folder in ("renders", "gt", "comparisons"):
+            for folder in ("renders", "gt", "comparisons", "float_arrays"):
                 (directory / folder).mkdir(exist_ok=True)
     rows = []
     for camera in tqdm(views, desc="Evaluate", leave=False):
-        prediction = prediction_image(camera, gray, gaussians, pipe, background, dataset, device)
+        prediction = prediction_image(camera, gray, gaussians, pipe, background, dataset, device, override_opacity)
         target = target_image(camera, device)
         if prediction.shape != target.shape:
             raise ValueError("Image dimensions differ: " + camera.image_name)
@@ -115,17 +118,27 @@ def evaluate(views, gray, gaussians, pipe, background, dataset, device, beta,
             "PSNR": -10.0 * math.log10(max(mse, 1e-12)),
             "SSIM": float(ssim(prediction[None], target[None])),
             "MSE": mse, "RMSE": math.sqrt(mse), "MAE": float(error.abs().mean()),
-            "radiance_loss": float(F.smooth_l1_loss(prediction, target, beta=beta)),
+            "radiance_loss": float(thermal_data_loss(prediction, target, loss_config or {"huber_delta": beta})),
+            "normalized_signal_huber_loss": float(F.smooth_l1_loss(prediction, target, beta=beta)),
         })
+        if radiometric_response is not None:
+            rows[-1].update(radiometric_image_errors(prediction, target, radiometric_response))
         if directory is not None and save_images:
+            np.save(directory / "float_arrays" / (camera.image_name + ".prediction.npy"), prediction.cpu().numpy())
+            np.save(directory / "float_arrays" / (camera.image_name + ".gt.npy"), target.cpu().numpy())
             filename = camera.image_name + ".png"
             save_image(prediction.clamp(0, 1), directory / "renders" / filename)
             save_image(target, directory / "gt" / filename)
             save_image(torch.cat((target, prediction, error.abs()), dim=-1).clamp(0, 1),
                        directory / "comparisons" / filename)
-    keys = ("PSNR", "SSIM", "MSE", "MAE", "radiance_loss")
+    keys = ("PSNR", "SSIM", "MSE", "MAE", "radiance_loss", "normalized_signal_huber_loss")
+    if radiometric_response is not None:
+        keys += ("camera_signal_MAE", "camera_signal_RMSE", "apparent_temperature_MAE_K")
     summary = {key: sum(row[key] for row in rows) / len(rows) for key in keys}
     summary.update(RMSE=math.sqrt(summary["MSE"]), views=len(rows))
+    if radiometric_response is not None:
+        span = float(radiometric_response.physical_radiance_max - radiometric_response.physical_radiance_min)
+        summary["camera_signal_RMSE"] = summary["RMSE"] * span
     if directory is not None:
         write_json(directory / "per_view.json", rows)
         write_json(directory / "metrics.json", summary)
@@ -147,9 +160,11 @@ def main():
     parser.add_argument("--stage2_checkpoint", required=True,
                         help="Existing common checkpoint: exact split and initial radiance")
     parser.add_argument("--geometry_model", default="", help="Override if geometry directory moved")
+    parser.add_argument("--radiometric_dir", default="", help="Optional moved RJPEG signal directory")
     parser.add_argument("--steps", type=int, default=20000)
-    parser.add_argument("--gray_lr", type=float, default=1e-2)
-    parser.add_argument("--gray_lr_final", type=float, default=1e-4)
+    parser.add_argument("--gray_lr", type=float, default=None)
+    parser.add_argument("--gray_lr_final", type=float, default=None)
+    parser.add_argument("--lr_hold_fraction", type=float, default=None)
     parser.add_argument("--eval_every", type=int, default=500)
     parser.add_argument("--save_every", type=int, default=1000)
     parser.add_argument("--save_images", action="store_true")
@@ -158,8 +173,6 @@ def main():
         raise RuntimeError("Run on the CUDA server in the physir environment")
     if min(args.steps, args.eval_every, args.save_every) <= 0:
         raise ValueError("Step counts and evaluation/save intervals must be positive")
-    if not 0 < args.gray_lr_final <= args.gray_lr or not math.isfinite(args.gray_lr):
-        raise ValueError("Require finite 0 < gray_lr_final <= gray_lr")
     if not args.model_path:
         raise ValueError("Use -m to specify a new, separate output directory")
     checkpoint_path = Path(args.stage2_checkpoint).resolve()
@@ -168,8 +181,16 @@ def main():
         raise ValueError("Reference must be a stage2 checkpoint, not C/K/R")
     metadata = checkpoint.get("metadata", {})
     shared = metadata.get("shared_training_protocol", {})
-    if shared.get("observation_domain") != "normalized_dn":
-        raise ValueError("This diagnostic supports the current normalized_dn experiment only")
+    if shared.get("observation_domain") not in ("normalized_dn", "raw_rjpeg"):
+        raise ValueError("This diagnostic supports normalized_dn and raw_rjpeg experiments only")
+    if shared["observation_domain"] == "raw_rjpeg" and not isinstance(shared.get("radiometric_protocol"), dict):
+        raise ValueError("RJPEG checkpoint is missing its radiometric calibration protocol")
+    scaled = (shared.get("loss_scale_protocol") or {}).get("mode") == "fit_quantile"
+    args.gray_lr = args.gray_lr if args.gray_lr is not None else (1e-4 if scaled else 1e-2)
+    args.gray_lr_final = args.gray_lr_final if args.gray_lr_final is not None else (1e-6 if scaled else 1e-4)
+    args.lr_hold_fraction = args.lr_hold_fraction if args.lr_hold_fraction is not None else shared.get("lr_hold_fraction", 0.0)
+    if not 0 < args.gray_lr_final <= args.gray_lr or not math.isfinite(args.gray_lr) or not 0 <= args.lr_hold_fraction < 1:
+        raise ValueError("Invalid gray learning rates or hold fraction")
     beta = float(shared.get("huber_delta", 0.02))
     if not math.isfinite(beta) or beta <= 0:
         raise ValueError("Reference Huber delta must be finite and positive")
@@ -219,13 +240,20 @@ def main():
         field = MaterialThermalField.from_checkpoint(
             checkpoint, "stage2", device, reset_branch_parameters=False)
         config = checkpoint["config"]
-        planck = UniformLWIRPlanckLUT(config["temp_min"], config["temp_max"]).to(device)
+        args.observation_domain = shared["observation_domain"]
+        args.temp_min, args.temp_max = config["temp_min"], config["temp_max"]
+        args.radiometric_protocol = shared.get("radiometric_protocol")
+        args.radiometric_dir = args.radiometric_dir or shared.get("radiometric_dir", "")
+        planck = prepare_thermal_input(args, scene.getTrainCameras() + scene.getTestCameras(), device)
         initial_gray = field.radiance(planck).detach().clone()
+        opacity_field = IROpacityCorrection.from_checkpoint(checkpoint, gaussians.get_opacity, trainable=False)
+        override_opacity = opacity_field.opacity.detach() if opacity_field is not None else None
     if initial_gray.shape != (gaussians.get_xyz.shape[0], 1):
         raise ValueError("Reference field and geometry have different Gaussian counts")
     if not bool(torch.isfinite(initial_gray).all()):
         raise FloatingPointError("Reference initial radiance is non-finite")
-    del field, planck, checkpoint
+    del field, checkpoint
+    radiometric_response = planck if args.observation_domain == "raw_rjpeg" else None
     gray = torch.nn.Parameter(initial_gray.clone())
     background = torch.zeros(3, device=device)
     protocol = {
@@ -240,13 +268,19 @@ def main():
                         "test": "published_rgb_test_and_thermal_test"},
         "seed": args.seed, "steps": args.steps, "gray_lr": args.gray_lr,
         "gray_lr_final": args.gray_lr_final, "eval_every": args.eval_every,
-        "resolution": args.resolution, "observation_domain": "normalized_dn",
-        "loss": "Huber only", "huber_delta": beta, "gray_bounds": [0, 1],
-        "initialization": "per_Gaussian_stage2_final_radiance",
+        "resolution": args.resolution, "observation_domain": args.observation_domain,
+        "loss": "scaled Huber only", "huber_delta": beta, "gray_bounds": [0, 1],
+        "loss_scale_protocol": shared.get("loss_scale_protocol"), "lr_hold_fraction": args.lr_hold_fraction,
+        "initialization": "per_Gaussian_stage2_reference_radiance",
+        "ir_opacity_enabled": override_opacity is not None,
+        "ir_opacity_trainable": False,
+        "ir_opacity_source": "stage2_reference_checkpoint",
         "selection": "minimum_internal_validation_Huber_including_initialization",
         "metric_data_range": 1.0, "ssim_window_size": 11,
         "comparison_order": ["ground_truth", "prediction", "absolute_error"],
     }
+    if args.observation_domain == "raw_rjpeg":
+        protocol["radiometric_protocol"] = args.radiometric_protocol
     write_json(output / "protocol.json", protocol)
     print("[split] fit=%d, internal_validation=%d, published_test=%d" %
           (len(views["fit"]), len(views["validation"]), len(views["test"])), flush=True)
@@ -255,7 +289,7 @@ def main():
     for split in ("fit", "validation"):
         initial_metrics[split] = evaluate(
             views[split], gray, gaussians, pipe, background, dataset, device, beta,
-            output / "evaluation_initial" / split, args.save_images)
+            output / "evaluation_initial" / split, args.save_images, radiometric_response, loss_config=shared, override_opacity=override_opacity)
     append_log(log, {"step": 0, "initial_metrics": initial_metrics})
     best_validation, best_step = initial_metrics["validation"]["radiance_loss"], 0
     save_control(output / "gray_best.pt", gray, 0, best_validation, protocol)
@@ -266,15 +300,14 @@ def main():
         position = (step - 1) % len(cameras)
         if position == 0:
             rng.shuffle(order)
-        lr = math.exp(math.log(args.gray_lr) * (1 - step / args.steps) +
-                      math.log(args.gray_lr_final) * (step / args.steps))
+        lr = held_lr(step, args.steps, args.gray_lr, args.gray_lr_final, args.lr_hold_fraction)
         optimizer.param_groups[0]["lr"] = lr
         camera = cameras[order[position]]
-        prediction = prediction_image(camera, gray, gaussians, pipe, background, dataset, device)
+        prediction = prediction_image(camera, gray, gaussians, pipe, background, dataset, device, override_opacity)
         target = target_image(camera, device)
         if prediction.shape != target.shape:
             raise ValueError("Image dimensions differ: " + camera.image_name)
-        loss = F.smooth_l1_loss(prediction, target, beta=beta)
+        loss = thermal_data_loss(prediction, target, shared)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if gray.grad is None or not bool(torch.isfinite(gray.grad).all()):
@@ -286,7 +319,7 @@ def main():
             append_log(log, {"step": step, "gray_lr": lr, "radiance_loss": float(loss.detach())})
         if step % args.eval_every == 0 or step == args.steps:
             metrics = evaluate(views["validation"], gray, gaussians, pipe, background,
-                               dataset, device, beta)
+                               dataset, device, beta, radiometric_response=radiometric_response, loss_config=shared, override_opacity=override_opacity)
             if metrics["radiance_loss"] < best_validation:
                 best_validation, best_step = metrics["radiance_loss"], step
                 save_control(output / "gray_best.pt", gray, step, best_validation, protocol)
@@ -301,17 +334,26 @@ def main():
     for split in ("fit", "validation"):
         report["final"][split] = evaluate(
             views[split], gray, gaussians, pipe, background, dataset, device, beta,
-            output / "evaluation_final" / split, args.save_images)
+            output / "evaluation_final" / split, args.save_images, radiometric_response, loss_config=shared, override_opacity=override_opacity)
     best = torch.load(output / "gray_best.pt", map_location=device)["gray"]
     for split in ("fit", "validation", "test"):
         report["best"][split] = evaluate(
             views[split], best, gaussians, pipe, background, dataset, device, beta,
-            output / "evaluation_best" / split, args.save_images)
+            output / "evaluation_best" / split, args.save_images, radiometric_response, loss_config=shared, override_opacity=override_opacity)
         print("[best/%s] %s" % (split, json.dumps(report["best"][split])), flush=True)
     report["validation_change_from_stage2"] = {
         key: report["best"]["validation"][key] - initial_metrics["validation"][key]
         for key in ("PSNR", "SSIM", "radiance_loss")
     }
+    if args.observation_domain == "raw_rjpeg":
+        # Recoloring can reuse the reference checkpoint's frozen display map.
+        for phase in ("initial", "final", "best"):
+            phase_report = {"modality": "thermal", "observation_domain": "raw_rjpeg",
+                "metric_domain": "full_frame_float_normalized_camera_signal",
+                "radiometric_protocol": args.radiometric_protocol,
+                "loss_scale_protocol": shared.get("loss_scale_protocol"),
+                "kind": "free_gray_control", "splits": report[phase]}
+            write_json(output / ("evaluation_" + phase) / "metrics.json", phase_report)
     write_json(output / "metrics.json", report)
     print("[done] " + str(output), flush=True)
 

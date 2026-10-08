@@ -4,10 +4,14 @@ This is inference, not SAM2 training. Manual keyframes partition the sequence in
 nearest-keyframe intervals; object IDs are local to an interval. Region indices
 are never mistaken for persistent cross-keyframe identities. No SAM2 core edits.
 Run only on the server with numpy, Pillow, torch, and SAM2 installed.
+Material classes are read from class_map.json; no scene-specific class list.
+--validate_only checks masks and priors without loading torch, SAM2 or weights.
 """
 import argparse
+import colorsys
 from contextlib import nullcontext
 import gc
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -17,13 +21,10 @@ import tempfile
 
 import numpy as np
 from PIL import Image
-import torch
 
 
-MATERIALS = ["paint", "plastic", "rubber", "metal", "glass"]
-OUTPUT_IDS = {name: index for index, name in enumerate(MATERIALS)}
 UNKNOWN = 255
-COLORS = {"paint": (235, 70, 70), "plastic": (245, 170, 40),
+PRESET_COLORS = {"paint": (235, 70, 70), "plastic": (245, 170, 40),
           "rubber": (160, 85, 210), "metal": (45, 190, 100),
           "glass": (40, 160, 240)}
 SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
@@ -43,6 +44,90 @@ def write_json(path, value):
                     + "\n", encoding="utf-8")
 
 
+def material_name(value):
+    if not isinstance(value, str):
+        raise ValueError("Material names must be text.")
+    name = value.strip().lower()
+    return "unknown" if name in {"", "unknown", "ignore"} else name
+
+
+def material_color(name):
+    if name in PRESET_COLORS:
+        return list(PRESET_COLORS[name])
+    hue = int.from_bytes(hashlib.sha256(name.encode("utf-8")).digest()[:4], "big") / 2**32
+    return [round(channel * 255) for channel in colorsys.hsv_to_rgb(hue, 0.72, 0.95)]
+
+
+def read_material_schema(document, records):
+    rows = document.get("classes", document.get("materials"))
+    if not isinstance(rows, list):
+        raise ValueError("class_map.json needs a classes or materials list.")
+    unknown_id = document.get("unknown_id", document.get("unknown_label", 255))
+    def valid_id(value):
+        return not isinstance(value, bool) and isinstance(value, int) and 0 <= value <= 255
+    if not valid_id(unknown_id):
+        raise ValueError("Unknown source ID must be an integer in [0, 255].")
+    source_ids, colors, seen_ids, seen_names = {}, {}, set(), set()
+    for row in rows:
+        name, source_id = material_name(row["name"]), row["id"]
+        if not valid_id(source_id) or source_id in seen_ids or name in seen_names:
+            raise ValueError("Source class names/IDs must be unique uint8 values.")
+        seen_ids.add(source_id)
+        seen_names.add(name)
+        if name == "unknown":
+            if source_id != unknown_id:
+                raise ValueError("Unknown row ID differs from unknown_id/unknown_label.")
+            continue
+        if source_id == unknown_id:
+            raise ValueError("A material cannot use the unknown source ID.")
+        source_ids[name] = source_id
+        color = row.get("color_rgb", material_color(name))
+        if (not isinstance(color, (list, tuple)) or len(color) != 3 or
+                any(isinstance(c, bool) or not isinstance(c, int) or not 0 <= c <= 255 for c in color)):
+            raise ValueError("color_rgb needs three integers in [0, 255].")
+        colors[name] = list(color)
+    if not source_ids or len(source_ids) > 255:
+        raise ValueError("Expected 1..255 source material classes.")
+    epsilons = {}
+    for record in records.values():
+        for region in record.get("regions", []):
+            name = material_name(region["material"])
+            if name == "unknown":
+                continue
+            if name not in source_ids:
+                raise ValueError("Manifest material absent from class_map.json: " + name)
+            values = epsilons.setdefault(name, set())
+            epsilon = region.get("epsilon_assumed")
+            if epsilon is not None:
+                value = float(epsilon)
+                if not math.isfinite(value) or not 0.01 <= value <= 0.99:
+                    raise ValueError("Stage-2 epsilon must lie in [0.01, 0.99]: " + name)
+                values.add(value)
+    invalid = {name: sorted(values) for name, values in epsilons.items() if len(values) != 1}
+    if invalid:
+        raise ValueError("Each observed material needs one consistent epsilon assumption: " + str(invalid))
+    if not epsilons:
+        raise ValueError("Manifest contains no material-labelled regions.")
+    # Ignore unobserved classes in a reusable global map; no invented priors.
+    names = sorted(epsilons, key=source_ids.__getitem__)
+    output_ids = {name: index for index, name in enumerate(names)}
+    epsilon_by_id = {output_ids[name]: next(iter(epsilons[name])) for name in names}
+    return source_ids, unknown_id, output_ids, colors, epsilon_by_id
+
+
+def material_rows(output_ids, epsilon_by_id, learned_materials):
+    learned = {material_name(name) for name in learned_materials}
+    absent = learned - set(output_ids)
+    if absent:
+        raise ValueError("--learn_materials names absent from this scene: " + ", ".join(sorted(absent)))
+    return [{"id": class_id, "name": name, "epsilon0": epsilon_by_id[class_id],
+             "confirmed": True, "source": "User-entered VIA epsilon assumption",
+             "surface_condition": "Manual image-based label; not measured emissivity",
+             "learn_k": name in learned, "learn_delta": name in learned,
+             "k_prior": 0.0, "sigma_k": 0.0001, "sigma_delta": 0.05}
+            for name, class_id in output_ids.items()]
+
+
 def relative_file(root, filename):
     path = (root / filename).resolve()
     if not path.is_relative_to(root.resolve()):
@@ -60,7 +145,7 @@ def load_label(path):
     return value
 
 
-def load_keyframe(record, mask_root, source_ids, unknown_id, dimensions):
+def load_keyframe(record, mask_root, source_ids, unknown_id, dimensions, output_ids):
     semantic = load_label(relative_file(mask_root, record["material_mask"]))
     if semantic.shape != dimensions:
         raise ValueError(record["filename"] + ": mask/RGB dimensions differ")
@@ -68,13 +153,13 @@ def load_keyframe(record, mask_root, source_ids, unknown_id, dimensions):
     if not np.isin(semantic, valid_ids).all():
         raise ValueError(record["filename"] + ": mask contains unmapped class IDs")
     remapped = np.full(dimensions, UNKNOWN, dtype=np.uint8)
-    for material, source_id in source_ids.items():
-        remapped[semantic == source_id] = OUTPUT_IDS[material]
+    for material, output_id in output_ids.items():
+        remapped[semantic == source_ids[material]] = output_id
     objects = []
     covered = np.zeros(dimensions, dtype=bool)
     for region in record.get("regions", []):
-        material = region["material"]
-        if material not in OUTPUT_IDS:
+        material = material_name(region["material"])
+        if material not in output_ids:
             continue
         raw = load_label(relative_file(mask_root, region["mask"]))
         if raw.shape != dimensions:
@@ -92,7 +177,7 @@ def load_keyframe(record, mask_root, source_ids, unknown_id, dimensions):
     return remapped, objects
 
 
-def save_frame(path, output, labels, confidence, epsilon_by_id, metadata):
+def save_frame(path, output, labels, confidence, epsilon_by_id, metadata, output_ids, colors):
     with Image.open(path) as image:
         rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
     known = labels != UNKNOWN
@@ -102,11 +187,11 @@ def save_frame(path, output, labels, confidence, epsilon_by_id, metadata):
     np.save(output / (path.stem + ".confidence.npy"), confidence.astype(np.float32))
     epsilon = np.full(labels.shape, np.nan, dtype=np.float32)
     overlay = rgb.copy()
-    for material, class_id in OUTPUT_IDS.items():
+    for material, class_id in output_ids.items():
         selected = labels == class_id
         epsilon[selected] = epsilon_by_id[class_id]
         overlay[selected] = np.rint(0.55 * rgb[selected] + 0.45 * np.array(
-            COLORS[material])).astype(np.uint8)
+            colors[material])).astype(np.uint8)
     Image.fromarray(overlay).save(output / "overlay" / (path.stem + ".png"))
     np.save(output / "emissivity" / (path.stem + ".npy"), epsilon)
     return {"filename": path.name, **metadata,
@@ -122,7 +207,8 @@ def main():
                         help="masks_sample/manifest.json from json_to_mask.py")
     parser.add_argument("--output_dir", required=True, type=Path,
                         help="New/empty output directory; label PNGs go directly here")
-    parser.add_argument("--checkpoint", required=True, type=Path)
+    parser.add_argument("--checkpoint", type=Path,
+                        help="SAM2 checkpoint; required unless --validate_only")
     parser.add_argument("--model_cfg", default="configs/sam2.1/sam2.1_hiera_t.yaml")
     parser.add_argument("--sam2_root", type=Path, default=Path(__file__).resolve().parents[1]
                         / "third_party" / "sam2")
@@ -133,17 +219,15 @@ def main():
     parser.add_argument("--unknown_epsilon0", type=float, default=0.9,
                         help="Explicit fallback assumption for later training, not a measurement")
     parser.add_argument("--tmp_dir", type=Path, help="Optional temporary JPEG parent directory")
+    parser.add_argument("--validate_only", action="store_true",
+                        help="Validate schema, priors and all keyframe masks; no model or output writes")
+    parser.add_argument("--learn_materials", nargs="+", default=[],
+                        help="Explicit materials enabling both K and R; default keeps all fixed")
     args = parser.parse_args()
     if not math.isfinite(args.logit_threshold):
         raise ValueError("--logit_threshold must be finite")
     if not 0.01 <= args.unknown_epsilon0 <= 0.99:
         raise ValueError("--unknown_epsilon0 must be in [0.01, 0.99]")
-    if not args.checkpoint.is_file():
-        raise FileNotFoundError("Checkpoint not found: " + str(args.checkpoint))
-    if args.device.startswith("cuda") and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested but unavailable")
-    if not (args.sam2_root / "sam2" / "build_sam.py").is_file():
-        raise FileNotFoundError("Invalid --sam2_root: " + str(args.sam2_root))
     paths = sorted((path for path in args.image_dir.iterdir() if path.is_file()
                     and path.suffix.lower() in SUFFIXES), key=natural_key)
     if args.frame_list:
@@ -168,60 +252,50 @@ def main():
     manifest = read_json(args.mask_manifest)
     mask_root = args.mask_manifest.resolve().parent
     class_document = read_json(mask_root / "class_map.json")
-    source_unknown = int(class_document["unknown_id"])
-    source_ids = {row["name"]: int(row["id"]) for row in class_document["classes"]
-                  if row["name"] != "unknown"}
-    if set(source_ids) != set(MATERIALS):
-        raise ValueError("Expected paint/plastic/rubber/metal/glass in source class_map.json")
-    if len(set(source_ids.values()) | {source_unknown}) != len(MATERIALS) + 1:
-        raise ValueError("Source class IDs must be distinct")
     records = {row["filename"]: row for row in manifest["frames"]}
     if len(records) != len(manifest["frames"]):
         raise ValueError("Duplicate frame records in input manifest")
-    # Retain manually entered epsilon assumptions, with no silent class averaging.
-    epsilons = {material: set() for material in MATERIALS}
-    for record in records.values():
-        for region in record.get("regions", []):
-            material, epsilon = region["material"], region.get("epsilon_assumed")
-            if material in epsilons and epsilon is not None:
-                value = float(epsilon)
-                if not math.isfinite(value) or not 0.01 <= value <= 0.99:
-                    raise ValueError("Invalid material epsilon in manifest")
-                epsilons[material].add(value)
-    if any(len(values) != 1 for values in epsilons.values()):
-        raise ValueError("Each material must have one consistent epsilon assumption: " + str(epsilons))
-    epsilon_by_id = {OUTPUT_IDS[material]: next(iter(values))
-                     for material, values in epsilons.items()}
+    source_ids, source_unknown, output_ids, colors, epsilon_by_id = read_material_schema(
+        class_document, records)
+    materials = material_rows(output_ids, epsilon_by_id, args.learn_materials)
     seeds = []
     for index, path in enumerate(paths):
         record = records.get(path.name)
-        if record is not None and any(row.get("material") in OUTPUT_IDS
+        if record is not None and any(material_name(row.get("material", "unknown")) in output_ids
                                       for row in record.get("regions", [])):
             labels, objects = load_keyframe(record, mask_root, source_ids,
-                                             source_unknown, dimensions)
+                                             source_unknown, dimensions, output_ids)
             seeds.append((index, labels, objects))
     if not seeds:
         raise ValueError("No labelled keyframes match selected RGB filenames")
     ignored = sorted(set(records) - {path.name for path in paths})
     if ignored:
         print("[SAM2] Keyframes outside the selected subset are unused: " + ", ".join(ignored))
+    if args.validate_only:
+        print("[SAM2] Validated: frames=%d, keyframes=%d, materials=%d; no inference/output writes." % (
+            len(paths), len(seeds), len(output_ids)))
+        for row in materials:
+            print("  id=%d name=%s epsilon0=%.6g learn_k=%s learn_delta=%s" % (
+                row["id"], row["name"], row["epsilon0"], row["learn_k"], row["learn_delta"]))
+        return
     if args.output_dir.exists() and (not args.output_dir.is_dir()
                                      or any(args.output_dir.iterdir())):
         raise ValueError("Output must be new or empty: " + str(args.output_dir))
+    if args.checkpoint is None or not args.checkpoint.is_file():
+        raise FileNotFoundError("Checkpoint not found: " + str(args.checkpoint))
+    if not (args.sam2_root / "sam2" / "build_sam.py").is_file():
+        raise FileNotFoundError("Invalid --sam2_root: " + str(args.sam2_root))
+    import torch
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but unavailable")
+    sys.path.insert(0, str(args.sam2_root.resolve()))
+    from sam2.build_sam import build_sam2_video_predictor
+    predictor = build_sam2_video_predictor(args.model_cfg, str(args.checkpoint), device=args.device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for name in ("overlay", "emissivity"):
         (args.output_dir / name).mkdir()
     if args.tmp_dir:
         args.tmp_dir.mkdir(parents=True, exist_ok=True)
-    sys.path.insert(0, str(args.sam2_root.resolve()))
-    from sam2.build_sam import build_sam2_video_predictor
-    predictor = build_sam2_video_predictor(args.model_cfg, str(args.checkpoint), device=args.device)
-    materials = [{"id": class_id, "name": name, "epsilon0": epsilon_by_id[class_id],
-                  "confirmed": True, "source": "User-entered VIA epsilon assumption",
-                  "surface_condition": "Manual image-based label; not measured emissivity",
-                  "learn_k": name != "glass", "learn_delta": name != "glass",
-                  "k_prior": 0.0, "sigma_k": 0.0001, "sigma_delta": 0.05}
-                 for name, class_id in OUTPUT_IDS.items()]
     write_json(args.output_dir / "material_config.json", {
         "format_version": 1, "temperature_reference_K": 300.0,
         "spectral_band": "8-14 um approximation; verify actual sensor",
@@ -229,7 +303,11 @@ def main():
         "confirmation_note": "confirmed means manually supplied assumptions, not measured ground truth",
         "materials": materials})
     write_json(args.output_dir / "class_map.json", {
-        "unknown_label": UNKNOWN, "materials": materials,
+        "format_version": 2, "unknown_label": UNKNOWN, "unknown_id": UNKNOWN,
+        "classes": [{"id": class_id, "name": name, "color_rgb": colors[name]}
+                    for name, class_id in output_ids.items()] +
+                   [{"id": UNKNOWN, "name": "unknown", "color_rgb": [0, 0, 0]}],
+        "materials": materials,
         "source_class_ids": source_ids, "source_unknown_id": source_unknown})
     boundaries = [0] + [(seeds[i][0] + seeds[i + 1][0]) // 2 + 1
                         for i in range(len(seeds) - 1)] + [len(paths)]
@@ -267,7 +345,7 @@ def main():
                         known = best > args.logit_threshold
                         label = torch.full(best.shape, UNKNOWN, dtype=torch.uint8, device=best.device)
                         for local, object_id in enumerate(object_ids):
-                            label[known & (winners == local)] = OUTPUT_IDS[object_material[int(object_id)]]
+                            label[known & (winners == local)] = output_ids[object_material[int(object_id)]]
                         labels = label.cpu().numpy()
                         confidence = torch.where(known, torch.sigmoid(best), 0.0).cpu().numpy()
                         manual = index == seed_local
@@ -280,7 +358,7 @@ def main():
                                                   confidence, epsilon_by_id, {
                             "source_keyframe": paths[seed_index].name,
                             "manual_keyframe": manual, "segment": segment,
-                            "selected_sequence_index": begin + index}))
+                            "selected_sequence_index": begin + index}, output_ids, colors))
                         written.add(index)
                 if len(written) != len(chunk):
                     raise RuntimeError("Incomplete segment coverage: %d/%d" % (len(written), len(chunk)))
@@ -298,7 +376,8 @@ def main():
         "strategy": "nearest-keyframe intervals, per-region local objects, bidirectional propagation",
         "logit_threshold": args.logit_threshold,
         "notes": ["Output labels are RGB-coordinate labels, not registered TIR labels.",
-                  "Source 0=unknown/1..5 classes is remapped to output 255=unknown/0..4 classes.",
+                  "Source class IDs are read from class_map.json; output materials are contiguous from 0, unknown=255.",
+                  "K/R learning is disabled unless explicitly enabled with --learn_materials.",
                   "Objects are reset at segment boundaries; check discontinuities in overlays.",
                   "No matching across keyframes is claimed; missing/new parts need manual prompts.",
                   "Confidence is an uncalibrated sigmoid logit; manual known pixels have weight 1.",

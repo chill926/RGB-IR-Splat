@@ -42,7 +42,7 @@ def quaternion_multiply(q1, q2):
 def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_xyz, d_rotation, d_scaling, device, is_6dof=False,
            scaling_modifier=1.0, override_color=None, scale_factor=1, radiative_color=None, radiative_blend=0.0,
            physical_color=None, physical_blend=0.0, feature_set="rgb", detach_geometry=False,
-           opacity_threshold=0.0):
+           opacity_threshold=0.0, override_opacity=None):
     """
     Render the scene.
 
@@ -93,7 +93,13 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
     else:
         d_xyz_render = d_xyz.detach() if detach_geometry and torch.is_tensor(d_xyz) else d_xyz
         means3D = base_xyz + d_xyz_render
-    opacity = pc.get_opacity.detach() if detach_geometry else pc.get_opacity
+    if override_opacity is not None:
+        if override_opacity.shape != pc.get_opacity.shape:
+            raise ValueError("Override opacity must have one scalar per Gaussian")
+        # Keep gradients of the IR correction even while RGB geometry is detached.
+        opacity = override_opacity
+    else:
+        opacity = pc.get_opacity.detach() if detach_geometry else pc.get_opacity
     if float(opacity_threshold) > 0.0:
         opacity = torch.where(opacity >= float(opacity_threshold), opacity, torch.zeros_like(opacity))
 

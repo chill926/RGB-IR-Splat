@@ -12,17 +12,29 @@ import torch.nn.functional as F
 
 class UniformLWIRPlanckLUT(nn.Module):
     """Differentiable, uniformly weighted 8--14 um passband Planck LUT."""
-    def __init__(self, temp_min=250.0, temp_max=450.0, num_temp=4096, num_lambda=256):
+    def __init__(self, temp_min=250.0, temp_max=450.0, num_temp=4096, num_lambda=256,
+                 signal_calibration=None):
         super().__init__()
         temperatures = torch.linspace(float(temp_min), float(temp_max), int(num_temp), dtype=torch.float64)
-        wavelengths = torch.linspace(8e-6, 14e-6, int(num_lambda), dtype=torch.float64)
-        h, c, kb = 6.62607015e-34, 299792458.0, 1.380649e-23
-        lam, temp = wavelengths[:, None], temperatures[None, :]
-        exponent = (h * c / (lam * kb * temp)).clamp_max(80.0)
-        spectral = (2.0 * h * c * c) / lam.pow(5) / torch.expm1(exponent)
-        # Uniform normalized spectral response: integral R(lambda) dlambda = 1.
-        response = torch.full_like(wavelengths, 1.0 / float(wavelengths[-1] - wavelengths[0]))
-        radiance = torch.trapz(response[:, None] * spectral, wavelengths, dim=0)
+        if signal_calibration is None:
+            wavelengths = torch.linspace(8e-6, 14e-6, int(num_lambda), dtype=torch.float64)
+            h, c, kb = 6.62607015e-34, 299792458.0, 1.380649e-23
+            lam, temp = wavelengths[:, None], temperatures[None, :]
+            exponent = (h * c / (lam * kb * temp)).clamp_max(80.0)
+            spectral = (2.0 * h * c * c) / lam.pow(5) / torch.expm1(exponent)
+            # Uniform normalized spectral response: integral R(lambda) dlambda = 1.
+            response = torch.full_like(wavelengths, 1.0 / float(wavelengths[-1] - wavelengths[0]))
+            radiance = torch.trapz(response[:, None] * spectral, wavelengths, dim=0)
+        else:
+            from utils.flir_radiometry import validate_calibration
+            coefficients = validate_calibration(signal_calibration)
+            denominator = coefficients["PlanckR2"] * (
+                torch.exp(coefficients["PlanckB"] / temperatures) - coefficients["PlanckF"])
+            radiance = coefficients["PlanckR1"] / denominator
+            if not bool((denominator > 0).all()) or not bool(torch.isfinite(radiance).all()):
+                raise ValueError("Temperature bounds exceed the valid FLIR camera-response range")
+        if not bool((radiance[1:] > radiance[:-1]).all()):
+            raise ValueError("Blackbody response LUT must be strictly increasing")
         normalized = (radiance - radiance[0]) / (radiance[-1] - radiance[0])
         self.temp_min, self.temp_max = float(temp_min), float(temp_max)
         self.register_buffer("temperatures", temperatures.float())
@@ -70,6 +82,17 @@ class UniformLWIRPlanckLUT(nn.Module):
     def normalize_physical_radiance(self, physical_radiance):
         return ((physical_radiance - self.physical_radiance_min) /
                 (self.physical_radiance_max - self.physical_radiance_min)).clamp(0.0, 1.0)
+
+
+class FlirCameraResponseLUT(UniformLWIRPlanckLUT):
+    """Normalized FLIR blackbody camera signal, using this capture's coefficients.
+
+    Shares interpolation/inverse with the legacy LUT, but its unnormalized units
+    are Q=DN+O, not the uniform 8--14 um SI spectral radiance approximation.
+    """
+    def __init__(self, calibration, temp_min=250.0, temp_max=450.0, num_temp=4096):
+        super().__init__(temp_min, temp_max, num_temp=num_temp,
+                         signal_calibration=calibration)
 
 
 class MaterialThermalField(nn.Module):
@@ -348,7 +371,7 @@ def _visibility_and_projection_weight(gaussians, visibility_payload):
 
 @torch.no_grad()
 def map_thermal_observations_to_gaussians(gaussians, cameras, observation_transform=None,
-                                          visibility_provider=None):
+                                          visibility_provider=None, fallback_radiance=None):
     """Initialize Gaussian band radiance by multi-view projected thermal averaging."""
     device = gaussians.get_xyz.device
     total = torch.zeros(gaussians.get_xyz.shape[0], device=device)
@@ -367,7 +390,8 @@ def map_thermal_observations_to_gaussians(gaussians, cameras, observation_transf
         valid_weight = projection_weight[valid]
         total[valid] += sampled[valid] * valid_weight
         count[valid] += valid_weight
-    fallback = gaussian_initial_radiance(gaussians).reshape(-1)
+    fallback = (gaussian_initial_radiance(gaussians).reshape(-1) if fallback_radiance is None
+                else total.new_full(total.shape, float(fallback_radiance)))
     observed = torch.where(count > 0, total / count.clamp_min(1), fallback)
     return observed[:, None].clamp(1e-4, 1 - 1e-4)
 
@@ -485,12 +509,14 @@ def verify_frozen_geometry_state(gaussians, state):
             raise ValueError(f"Embedded frozen geometry differs from the loaded stage-1 tensor: {name}")
 
 
-def save_thermal_checkpoint(path, model, step, metadata=None, frozen_geometry=None):
+def save_thermal_checkpoint(path, model, step, metadata=None, frozen_geometry=None, ir_opacity=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = model.export_state()
     payload.update(step=int(step), metadata=metadata or {})
     if frozen_geometry is not None:
         payload["frozen_geometry"] = frozen_geometry
+    if ir_opacity is not None:
+        payload["ir_opacity"] = ir_opacity.export_state()
     torch.save(payload, path)
 
 
