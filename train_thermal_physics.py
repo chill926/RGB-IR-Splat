@@ -13,9 +13,10 @@ import torch.nn.functional as F
 from arguments import ModelParams, PipelineParams
 from gaussian_renderer import render
 from utils.thermal_opacity import IROpacityCorrection, render_opacity
+from utils.thermal_sh_residual import ThermalSHResidual, thermal_view_radiance
 from scene import GaussianModel, Scene
 from utils.thermal_training_utils import (held_lr, install_loss_scale, thermal_data_loss,
-    PlateauTracker, quality_status)
+    PlateauTracker, quality_status, masked_mean)
 from utils.thermal_observations import radiometric_image_errors
 from utils.thermal_observations import prepare_thermal_input
 from utils.thermal_physics import (MaterialThermalField,
@@ -33,6 +34,14 @@ def parse_args():
     parser.add_argument("--geometry_model", required=True)
     parser.add_argument("--geometry_iteration", type=int, default=-1)
     parser.add_argument("--stage2_checkpoint", default="")
+    parser.add_argument("--sh_residual_degree", type=int, choices=(0, 2), default=0,
+                        help="Fresh Stage2: 0 retains the baseline, 2 adds eight scalar non-DC SH coefficients")
+    parser.add_argument("--sh_residual_start_step", type=int, default=3000)
+    parser.add_argument("--sh_residual_bound", type=float, default=0.5,
+                        help="Maximum signed SH signal correction as a fraction of the fit loss scale")
+    parser.add_argument("--sh_residual_lr", type=float, default=0.01)
+    parser.add_argument("--sh_residual_lr_final", type=float, default=0.0001)
+    parser.add_argument("--lambda_sh_residual", type=float, default=0.001)
     parser.add_argument("--ir_opacity_mode", choices=("bounded", "frozen"), default="bounded",
                         help="G-alpha only: bounded IR correction or matched frozen-opacity control")
     parser.add_argument("--ir_opacity_logit_bound", type=float, default=0.2)
@@ -356,7 +365,9 @@ def checkpoint_metadata(args, scene, **extra):
         "seed": args.seed,
         "material_mask_dir": args.material_mask_dir,
         "training_stage": args.stage,
+        "initialization_weighted_mean_version": 2 if args.stage == "stage2" else None,
         "ir_opacity_protocol": getattr(args, "ir_opacity_protocol", {"enabled": False}),
+        "sh_residual_protocol": getattr(args, "sh_residual_protocol", {"enabled": False}),
         "warm_start_checkpoint_sha256": getattr(args, "warm_start_checkpoint_sha256", None),
         "shared_training_protocol": {
             "temperature_lr": args.temperature_lr,
@@ -471,6 +482,7 @@ def make_field(args, scene, device, planck, visibility_provider, fit_cameras, ma
             raise ValueError("Warm-start camera split differs from the recorded reference")
         verify_frozen_geometry_state(scene.gaussians, checkpoint.get("frozen_geometry"))
         args.reference_ir_opacity_state = checkpoint.get("ir_opacity")
+        args.reference_sh_residual_state = checkpoint.get("sh_residual")
         args.material_mask_dir = metadata.get("material_mask_dir", args.material_mask_dir)
         return MaterialThermalField.from_checkpoint(checkpoint,
             "stage2" if args.stage == "galpha" else args.branch, device)
@@ -516,25 +528,30 @@ def make_field(args, scene, device, planck, visibility_provider, fit_cameras, ma
 
 
 @torch.no_grad()
-def validation_metrics(field, planck, cameras, gaussians, pipe, background, dataset, args, opacity_field=None):
+def validation_metrics(field, planck, cameras, gaussians, pipe, background, dataset, args, opacity_field=None, sh_field=None):
     if not cameras:
         raise ValueError("Validation cameras are required")
-    radiance = field.radiance(planck).repeat(1, 3)
+    physical = field.radiance(planck)
     rows, mse_values = [], []
     for camera in cameras:
+        radiance, delta, clipped = thermal_view_radiance(physical, gaussians.get_xyz, camera.camera_center, sh_field)
         prediction = render(camera, gaussians, pipe, background, 0.0, 0.0, 0.0, device=background.device,
-            is_6dof=dataset.is_6dof, override_color=radiance, detach_geometry=True,
+            is_6dof=dataset.is_6dof, override_color=radiance.repeat(1, 3), detach_geometry=True,
             override_opacity=render_opacity(opacity_field))["render"][:1]
         target = camera.original_physical_image if camera.original_physical_image is not None else camera.original_image
         target = observation_to_model_radiance(target.mean(dim=0, keepdim=True), args, planck)
+        mask = getattr(camera, "thermal_valid_mask", None)
         error = prediction - target
-        mse = float(error.square().mean())
-        row = {"radiance_loss": float(thermal_data_loss(prediction, target, args)),
-               "normalized_signal_huber_loss": float(F.smooth_l1_loss(prediction, target, beta=args.huber_delta)),
-               "signal_MAE": float(error.abs().mean()), "signal_MSE": mse,
+        mse = float(error.square().mean() if mask is None else masked_mean(error.square(), mask))
+        huber = F.smooth_l1_loss(prediction, target, beta=args.huber_delta, reduction="none")
+        row = {"radiance_loss": float(thermal_data_loss(prediction, target, args, mask)),
+               "normalized_signal_huber_loss": float(huber.mean() if mask is None else masked_mean(huber, mask)),
+               "signal_MAE": float(error.abs().mean() if mask is None else masked_mean(error.abs(), mask)), "signal_MSE": mse,
                "signal_PSNR": -10 * math.log10(max(mse, 1e-12))}
         if args.observation_domain == "raw_rjpeg":
-            row.update(radiometric_image_errors(prediction, target, planck))
+            row.update(radiometric_image_errors(prediction, target, planck, mask))
+        if sh_field is not None:
+            row.update(sh_abs_delta_mean=float(delta.abs().mean()), sh_clipped_fraction=float(clipped))
         rows.append(row)
         mse_values.append(mse)
     result = {key: sum(row[key] for row in rows) / len(rows) for key in rows[0]}
@@ -548,6 +565,18 @@ def validation_metrics(field, planck, cameras, gaussians, pipe, background, data
 
 def main():
     args, dataset, pipe, device = parse_args()
+    if args.stage == "stage2" and args.stage2_checkpoint:
+        raise ValueError("Fresh Stage2 must not use --stage2_checkpoint; supply only Stage1 geometry")
+    if args.sh_residual_degree and args.stage != "stage2":
+        raise ValueError("New SH residuals are enabled only in fresh Stage2; C/R/K/G-alpha inherit them frozen")
+    if (not math.isfinite(args.sh_residual_bound) or args.sh_residual_bound <= 0 or
+            not all(math.isfinite(x) for x in (args.sh_residual_lr, args.sh_residual_lr_final, args.lambda_sh_residual)) or
+            not 0 < args.sh_residual_lr_final <= args.sh_residual_lr or args.lambda_sh_residual < 0):
+        raise ValueError("Invalid SH residual bound, learning rates, or regularization")
+    if args.sh_residual_degree and not 1 <= args.sh_residual_start_step <= args.steps:
+        raise ValueError("SH start step must lie inside the training budget")
+    if args.sh_residual_degree and args.stage2_stop_mode != "budget":
+        raise ValueError("SH experiments use fixed budget; coefficient convergence is not covered by the old plateau rule")
     apply_stage2_protocol(args)
     args.warm_start_checkpoint_sha256 = file_sha256(args.stage2_checkpoint) if args.stage2_checkpoint else None
     apply_regularization_protocol(args)
@@ -705,6 +734,23 @@ def main():
         "support": "reference_fit_frustum_and_nonzero_RGB_opacity",
         "RGB_opacity_changed": False}
     print("[ir-opacity] " + json.dumps(args.ir_opacity_protocol))
+    sh_field = ThermalSHResidual.from_checkpoint(
+        {"sh_residual": getattr(args, "reference_sh_residual_state", None)}, gaussians.get_xyz, trainable=False)
+    if args.sh_residual_degree == 2:
+        signal_bound = args.sh_residual_bound * float(args.loss_scale_protocol["scale"])
+        sh_field = ThermalSHResidual(gaussians.get_xyz, support, signal_bound, trainable=True).to(device)
+    args.sh_residual_protocol = {"enabled": sh_field is not None,
+        "trainable": sh_field is not None and sh_field.raw.requires_grad,
+        "degree": 2 if sh_field is not None else 0, "channels": 1, "DC_trainable": False,
+        "coefficients_per_gaussian": 8 if sh_field is not None else 0,
+        "signal_bound": sh_field.signal_bound if sh_field is not None else None,
+        "bound_fraction_of_loss_scale": args.sh_residual_bound if args.sh_residual_degree else None,
+        "start_step": args.sh_residual_start_step if args.sh_residual_degree else None,
+        "lr": args.sh_residual_lr, "lr_final": args.sh_residual_lr_final,
+        "lambda": args.lambda_sh_residual, "fresh_stage2_initialization": args.stage == "stage2",
+        "direction": "normalized_Gaussian_xyz_minus_camera_center",
+        "support": "fit_frustum_nonzero_RGB_opacity", "signal_clamp_before_blending": [0, 1]}
+    print("[sh-residual] " + json.dumps(args.sh_residual_protocol))
     environment_anchor = field.environment.detach().clone()
     optimizer_groups = [
         {"name": "temperature", "params": [field.temperature_raw], "lr": args.temperature_lr},
@@ -716,6 +762,8 @@ def main():
         optimizer_groups.append({"name": "material", "params": [field.delta_epsilon_raw], "lr": args.material_lr})
     if opacity_field is not None and opacity_field.raw.requires_grad:
         optimizer_groups.append({"name": "ir_opacity", "params": [opacity_field.raw], "lr": args.ir_opacity_lr})
+    if sh_field is not None and sh_field.raw.requires_grad:
+        optimizer_groups.append({"name": "sh_residual", "params": [sh_field.raw], "lr": 0.0})
     optimizer = torch.optim.Adam(optimizer_groups)
     cameras, background = fit_cameras, torch.zeros(3, device=device)
     camera_order = list(range(len(cameras)))
@@ -724,13 +772,13 @@ def main():
     tracker = PlateauTracker(args.stage2_min_delta, args.stage2_relative_min_delta)
     final_step, stop_reason = 0, "max_steps"
     stable = False
-    latest_metrics = validation_metrics(field, planck, validation_cameras, gaussians, pipe, background, dataset, args, opacity_field)
+    latest_metrics = validation_metrics(field, planck, validation_cameras, gaussians, pipe, background, dataset, args, opacity_field, sh_field)
     tracker.update(latest_metrics["radiance_loss"], 0)
     initial_status = quality_status(latest_metrics, args.quality_apparent_mae_K, args.quality_signal_rmse_Q)
     save_thermal_checkpoint(os.path.join(args.model_path, f"thermal_{field.branch}_best.pt"), field, 0,
         checkpoint_metadata(args, scene, validation_radiance_loss=tracker.best,
             validation_metrics=latest_metrics, quality_status=initial_status),
-        frozen_geometry=frozen_geometry_state(scene.gaussians), ir_opacity=opacity_field)
+        frozen_geometry=frozen_geometry_state(scene.gaussians), ir_opacity=opacity_field, sh_residual=sh_field)
     with open(log_path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps({"step": 0, "initial_validation_metrics": latest_metrics,
                                  "quality_status": initial_status}) + "\n")
@@ -748,14 +796,16 @@ def main():
         if camera_position == 0:
             camera_rng.shuffle(camera_order)
         camera = cameras[camera_order[camera_position]]
-        radiance = field.radiance(planck)
+        radiance, sh_delta, sh_clipped = thermal_view_radiance(
+            field.radiance(planck), gaussians.get_xyz, camera.camera_center, sh_field)
         prediction = render(camera, gaussians, pipe, background, 0.0, 0.0, 0.0, device,
             dataset.is_6dof, override_color=radiance.repeat(1, 3), detach_geometry=True,
             override_opacity=render_opacity(opacity_field))["render"]
         target = camera.original_physical_image if camera.original_physical_image is not None else camera.original_image
         target = target.mean(dim=0, keepdim=True).repeat(3, 1, 1)
         target = observation_to_model_radiance(target, args, planck)
-        rad_loss = thermal_data_loss(prediction, target, args)
+        mask = getattr(camera, "thermal_valid_mask", None)
+        rad_loss = thermal_data_loss(prediction, target, args, mask)
         if pair_i.numel():
             temperature = field.temperature.reshape(-1)
             tv_loss_K = (pair_w * (temperature[pair_i] - temperature[pair_j]).abs()).sum() / pair_w.sum().clamp_min(1e-12)
@@ -773,6 +823,9 @@ def main():
                         else rad_loss.new_zeros(()))
         loss = rad_loss + args.lambda_tv * tv_loss + args.lambda_environment * environment_loss
         loss = loss + args.lambda_ir_opacity * opacity_loss
+        sh_loss = (sh_field.regularizer() if sh_field is not None and sh_field.raw.requires_grad
+                   else rad_loss.new_zeros(()))
+        loss = loss + args.lambda_sh_residual * sh_loss
         branch_regularization_weight = (
             args.lambda_k if field.branch == "K"
             else (args.lambda_delta_epsilon if field.branch == "R" else 0.0)
@@ -797,6 +850,9 @@ def main():
         if gradient_diagnostics and opacity_field is not None and opacity_field.raw.requires_grad:
             opacity_grad = torch.autograd.grad(rad_loss, opacity_field.raw, retain_graph=True)[0]
             gradient_diagnostics["ir_opacity_data_gradient_norm"] = float(opacity_grad.norm())
+        if gradient_diagnostics and sh_field is not None and sh_field.raw.requires_grad:
+            sh_grad = torch.autograd.grad(rad_loss, sh_field.raw, retain_graph=True)[0]
+            gradient_diagnostics["sh_data_gradient_norm"] = float(sh_grad.norm())
         for group in optimizer.param_groups:
             if group["name"] == "temperature":
                 group["lr"] = held_lr(step, args.steps, args.temperature_lr, args.temperature_lr_final, args.lr_hold_fraction)
@@ -804,14 +860,26 @@ def main():
                 group["lr"] = held_lr(step, args.steps, args.environment_lr, args.environment_lr_final, args.lr_hold_fraction)
             elif group["name"] == "ir_opacity":
                 group["lr"] = held_lr(step, args.steps, args.ir_opacity_lr, args.ir_opacity_lr_final, args.lr_hold_fraction)
+            elif group["name"] == "sh_residual":
+                group["lr"] = (0.0 if step < args.sh_residual_start_step else held_lr(
+                    step - args.sh_residual_start_step + 1, args.steps - args.sh_residual_start_step + 1,
+                    args.sh_residual_lr, args.sh_residual_lr_final, args.lr_hold_fraction))
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if sh_field is not None and sh_field.raw.requires_grad:
+            if sh_field.raw.grad is None or not bool(torch.isfinite(sh_field.raw.grad).all()):
+                raise FloatingPointError("Missing or non-finite thermal SH residual gradient")
+            if step < args.sh_residual_start_step:
+                # Warm up only the physical field; do not accumulate Adam
+                # moments from gradients of a branch that is still disabled.
+                sh_field.raw.grad = None
         if opacity_field is not None and opacity_field.raw.requires_grad:
             if opacity_field.raw.grad is None or not bool(torch.isfinite(opacity_field.raw.grad).all()):
                 raise FloatingPointError("Missing or non-finite IR opacity gradient")
         optimizer.step()
 
         if step == 1 or step % 100 == 0 or step == args.steps or gradient_diagnostics:
+            normalized_huber = F.smooth_l1_loss(prediction.detach(), target, beta=args.huber_delta, reduction="none")
             learning_rates = {group["name"]: float(group["lr"]) for group in optimizer.param_groups}
             has_temperature_truth = temperature_truth is not None
             current_temperature = field.temperature.detach()
@@ -829,6 +897,13 @@ def main():
                                   else "calibrated_radiance_inversion")))
             )
             record = {"step": step, "branch": field.branch,
+                "sh_residual_lr": learning_rates.get("sh_residual", 0.0),
+                "sh_prior_loss": float(sh_loss.detach()),
+                "weighted_sh_prior_loss": float((args.lambda_sh_residual * sh_loss).detach()),
+                "sh_view_abs_delta_mean": float(sh_delta.detach().abs().mean()),
+                "sh_view_abs_delta_max": float(sh_delta.detach().abs().max()),
+                "sh_view_clipped_fraction": float(sh_clipped.detach()),
+                **(sh_field.diagnostics() if sh_field is not None else {}),
                 "temperature_lr": learning_rates["temperature"],
                 "environment_lr": learning_rates["environment"],
                 "ir_opacity_lr": learning_rates.get("ir_opacity", 0.0),
@@ -840,7 +915,7 @@ def main():
                 "weighted_tv_loss": float((args.lambda_tv * tv_loss).detach()),
                 "weighted_environment_loss": float((args.lambda_environment * environment_loss).detach()),
                 "weighted_material_loss": float((branch_regularization_weight * material_loss).detach()),
-                "normalized_signal_huber_loss": float(F.smooth_l1_loss(prediction.detach(), target, beta=args.huber_delta)),
+                "normalized_signal_huber_loss": float(normalized_huber.mean() if mask is None else masked_mean(normalized_huber, mask)),
                 "tv_to_data_loss_ratio": float((args.lambda_tv * tv_loss).detach()) / max(float(rad_loss.detach()), 1e-12),
                 "environment_mean": float(field.environment.detach().mean()),
                 **gradient_diagnostics,
@@ -864,10 +939,10 @@ def main():
             with open(log_path, "a", encoding="utf-8") as handle: handle.write(json.dumps(record) + "\n")
         if step % args.save_every == 0 or step == args.steps:
             save_thermal_checkpoint(os.path.join(args.model_path, f"thermal_{field.branch}_step_{step}.pt"),
-                field, step, checkpoint_metadata(args, scene), ir_opacity=opacity_field)
+                field, step, checkpoint_metadata(args, scene), ir_opacity=opacity_field, sh_residual=sh_field)
         if args.eval_every > 0 and (step % args.eval_every == 0 or step == args.steps):
             latest_metrics = validation_metrics(field, planck, validation_cameras, gaussians,
-                                                pipe, background, dataset, args, opacity_field)
+                                                pipe, background, dataset, args, opacity_field, sh_field)
             validation = latest_metrics["radiance_loss"]
             updates = (field.temperature.detach() - previous_eval_temperature).abs().reshape(-1)
             temperature_update = float((updates * support_weights).sum() / support_weights.sum().clamp_min(1e-12))
@@ -910,7 +985,7 @@ def main():
                 save_thermal_checkpoint(os.path.join(args.model_path, f"thermal_{field.branch}_best.pt"),
                     field, step, checkpoint_metadata(args, scene, validation_radiance_loss=validation,
                     validation_metrics=latest_metrics, quality_status=status),
-                    frozen_geometry=frozen_geometry_state(scene.gaussians), ir_opacity=opacity_field)
+                    frozen_geometry=frozen_geometry_state(scene.gaussians), ir_opacity=opacity_field, sh_residual=sh_field)
             if (args.stage in ("stage2", "galpha") and args.stage2_stop_mode == "plateau" and
                     step >= args.stage2_min_steps and tracker.stale >= args.stage2_patience and stable):
                 stop_reason = "plateau"
@@ -918,7 +993,7 @@ def main():
 
     test_radiance_loss = None
     if args.stage == "branch":
-        test_metrics = validation_metrics(field, planck, test_cameras, gaussians, pipe, background, dataset, args, opacity_field)
+        test_metrics = validation_metrics(field, planck, test_cameras, gaussians, pipe, background, dataset, args, opacity_field, sh_field)
         test_radiance_loss = test_metrics["radiance_loss"]
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps({"step": final_step, "branch": field.branch,
@@ -937,12 +1012,14 @@ def main():
         "stage2_relative_min_delta": args.stage2_relative_min_delta,
         "selection": "minimum_internal_validation_scaled_Huber", "test_used_for_selection": False,
         "training_stage": args.stage, "ir_opacity_protocol": args.ir_opacity_protocol,
+        "sh_residual_protocol": args.sh_residual_protocol,
+        "final_sh_diagnostics": sh_field.diagnostics() if sh_field is not None else None,
         "final_ir_opacity_diagnostics": opacity_field.diagnostics() if opacity_field is not None else None}
     final_metadata = checkpoint_metadata(args, scene, best_validation_radiance_loss=tracker.best,
         final_test_radiance_loss=test_radiance_loss, stage2_common_endpoint=False,
         training_summary=training_summary, quality_status=status)
     save_thermal_checkpoint(os.path.join(args.model_path, f"thermal_{field.branch}_final.pt"),
-        field, final_step, final_metadata, frozen_geometry=frozen_geometry_state(scene.gaussians), ir_opacity=opacity_field)
+        field, final_step, final_metadata, frozen_geometry=frozen_geometry_state(scene.gaussians), ir_opacity=opacity_field, sh_residual=sh_field)
     if args.stage in ("stage2", "galpha"):
         best = torch.load(os.path.join(args.model_path, "thermal_stage2_best.pt"), map_location="cpu")
         best["metadata"].update(stage2_common_endpoint=True,
@@ -950,6 +1027,9 @@ def main():
             optimization_converged=(stop_reason == "plateau"), training_summary=training_summary)
         training_summary["selected_quality_status"] = best["metadata"]["quality_status"]
         training_summary["selected_validation_metrics"] = best["metadata"]["validation_metrics"]
+        if best.get("sh_residual") is not None:
+            selected_sh = ThermalSHResidual.from_checkpoint(best, gaussians.get_xyz, trainable=False)
+            training_summary["selected_sh_diagnostics"] = selected_sh.diagnostics()
         if best.get("ir_opacity") is not None:
             best_opacity = IROpacityCorrection.from_checkpoint(best,
                 best["ir_opacity"]["state_dict"]["base_opacity"], trainable=False)

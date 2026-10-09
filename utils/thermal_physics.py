@@ -385,6 +385,11 @@ def map_thermal_observations_to_gaussians(gaussians, cameras, observation_transf
         raster_visibility, projection_weight = _visibility_and_projection_weight(
             gaussians, visibility_payload)
         ndc, valid = _project_gaussians(gaussians, camera, raster_visibility=raster_visibility)
+        mask = getattr(camera, "thermal_valid_mask", None)
+        if mask is not None:
+            mask_sample = F.grid_sample(mask.to(device=device, dtype=torch.float32)[None], ndc[:, :2].reshape(1, -1, 1, 2),
+                mode="bilinear", padding_mode="zeros", align_corners=False).reshape(-1)
+            valid &= mask_sample >= 1 - 1e-6
         sampled = F.grid_sample(gray, ndc[:, :2].reshape(1, -1, 1, 2), mode="bilinear",
                                 padding_mode="zeros", align_corners=False).reshape(-1)
         valid_weight = projection_weight[valid]
@@ -392,7 +397,15 @@ def map_thermal_observations_to_gaussians(gaussians, cameras, observation_transf
         count[valid] += valid_weight
     fallback = (gaussian_initial_radiance(gaussians).reshape(-1) if fallback_radiance is None
                 else total.new_full(total.shape, float(fallback_radiance)))
-    observed = torch.where(count > 0, total / count.clamp_min(1), fallback)
+    # count is opacity * radius^2, not an integer observation count. Flooring
+    # it at one biases low-support Gaussians cold. Only zero support needs a
+    # protected denominator; every positive count uses its actual weight.
+    supported = count > 0
+    safe_count = torch.where(supported, count, torch.ones_like(count))
+    observed = torch.where(supported, total / safe_count, fallback)
+    print("[thermal-init] " + str({"weighted_mean_version": 2,
+        "supported_fraction": float(supported.float().mean()),
+        "below_one_weight_fraction": float((supported & (count < 1)).float().mean())}))
     return observed[:, None].clamp(1e-4, 1 - 1e-4)
 
 
@@ -509,7 +522,7 @@ def verify_frozen_geometry_state(gaussians, state):
             raise ValueError(f"Embedded frozen geometry differs from the loaded stage-1 tensor: {name}")
 
 
-def save_thermal_checkpoint(path, model, step, metadata=None, frozen_geometry=None, ir_opacity=None):
+def save_thermal_checkpoint(path, model, step, metadata=None, frozen_geometry=None, ir_opacity=None, sh_residual=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = model.export_state()
     payload.update(step=int(step), metadata=metadata or {})
@@ -517,6 +530,8 @@ def save_thermal_checkpoint(path, model, step, metadata=None, frozen_geometry=No
         payload["frozen_geometry"] = frozen_geometry
     if ir_opacity is not None:
         payload["ir_opacity"] = ir_opacity.export_state()
+    if sh_residual is not None:
+        payload["sh_residual"] = sh_residual.export_state()
     torch.save(payload, path)
 
 

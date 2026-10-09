@@ -43,6 +43,9 @@ def install_loss_scale(args, fit_cameras, transform=None):
             sample = image.detach().mean(dim=0, keepdim=True)[..., ::16, ::16]
             if transform is not None:
                 sample = transform(sample)
+            mask = getattr(camera, "thermal_valid_mask", None)
+            if mask is not None:
+                sample = sample[mask[..., ::16, ::16].bool()]
             samples.append(sample.cpu().numpy().reshape(-1))
         scale, lower, upper = scale_from_samples(np.concatenate(samples), args.loss_scale_floor)
     else:
@@ -55,9 +58,24 @@ def install_loss_scale(args, fit_cameras, transform=None):
         "units": "normalized_camera_signal" if args.observation_domain == "raw_rjpeg" else "model_observation",
         "held_out_pixels_used": False,
     }
+    if any(getattr(camera, "thermal_valid_mask", None) is not None for camera in fit_cameras):
+        args.loss_scale_protocol["pixel_policy"] = "valid_native_FOV_only"
 
 
-def thermal_data_loss(prediction, target, config):
+def masked_mean(value, mask=None):
+    if mask is None:
+        return value.mean()
+    import torch
+    weights = mask.to(device=value.device, dtype=value.dtype).expand_as(value)
+    if not bool(torch.isfinite(weights).all()) or bool(((weights < 0) | (weights > 1)).any()):
+        raise ValueError("Invalid thermal pixel mask")
+    denominator = weights.sum()
+    if not bool(denominator > 0):
+        raise ValueError("No valid thermal pixels")
+    return (value * weights).sum() / denominator
+
+
+def thermal_data_loss(prediction, target, config, mask=None):
     import torch
     import torch.nn.functional as F
     protocol = option(config, "loss_scale_protocol", None) or {}
@@ -66,7 +84,9 @@ def thermal_data_loss(prediction, target, config):
     if not math.isfinite(scale) or not math.isfinite(beta) or min(scale, beta) <= 0:
         raise ValueError("Huber beta and loss scale must be finite and positive")
     residual = (prediction - target) / scale
-    return F.smooth_l1_loss(residual, torch.zeros_like(residual), beta=beta)
+    if mask is None:
+        return F.smooth_l1_loss(residual, torch.zeros_like(residual), beta=beta)
+    return masked_mean(F.smooth_l1_loss(residual, torch.zeros_like(residual), beta=beta, reduction="none"), mask)
 
 
 def held_lr(step, steps, start, end, hold_fraction):

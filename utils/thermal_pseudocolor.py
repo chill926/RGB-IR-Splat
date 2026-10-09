@@ -15,6 +15,7 @@ from scipy.spatial import cKDTree
 
 from utils.flir_radiometry import (blackbody_signal, file_sha256, load_signal_frame,
     read_flir_display_metadata, validate_calibration)
+from utils.thermal_coordinates import validate_manifest_coordinates, load_valid_mask
 
 
 def inside_path(root, relative):
@@ -31,10 +32,10 @@ def load_manifest(scene, directory="radiometric", expected=None):
         directory = Path(scene) / directory
     path = directory / "manifest.json"
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    if (manifest.get("format_version") != 1 or manifest.get("kind") != "flir_rjpeg_camera_signal"
-            or manifest.get("signal_definition") != "Q = RawDN + PlanckO"
-            or manifest.get("coordinate_system") != "dataset_thermal_full_frame_resize"):
+    if (manifest.get("kind") != "flir_rjpeg_camera_signal"
+            or manifest.get("signal_definition") != "Q = RawDN + PlanckO"):
         raise ValueError("Pseudo-color requires prepared FLIR camera-signal inputs")
+    validate_manifest_coordinates(manifest)
     digest = file_sha256(path)
     calibration = validate_calibration(manifest["signal_calibration"])
     if expected is not None and (digest != expected["manifest_sha256"]
@@ -216,9 +217,11 @@ def calibrate_display(scene, directory, fit_names, output, camera_split=None,
             target = original_rgb(scene, name, record)[::stride, ::stride]
             if target.shape[:2] != signal.shape:
                 raise ValueError("Signal/original thermal dimensions differ: " + name)
-            samples.append(target.reshape(-1, 3))
+            valid = (load_valid_mask(directory, record)[::stride, ::stride] if manifest["format_version"] == 2
+                     else np.ones(signal.shape, dtype=bool))
+            samples.append(target[valid])
             coordinates.append(((signal - display["signal_window_center"]) /
-                                display["raw_value_range"] + .5).reshape(-1))
+                                display["raw_value_range"] + .5)[valid])
         samples, coordinates = np.concatenate(samples), np.concatenate(coordinates)
         candidates = {}
         for encoding in ("limited", "full"):

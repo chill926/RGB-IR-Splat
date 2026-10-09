@@ -39,7 +39,7 @@ def recolor(scene, evaluation_dir, calibration, output_dir, split="validation", 
     protocol = report.get("radiometric_protocol")
     if report.get("modality") != "thermal" or report.get("observation_domain") != "raw_rjpeg" or not protocol:
         raise ValueError("Source evaluation must contain normalized raw_rjpeg thermal renders")
-    if report.get("metric_domain") != "full_frame_float_normalized_camera_signal":
+    if report.get("metric_domain") not in ("full_frame_float_normalized_camera_signal", "valid_native_FOV_float_normalized_camera_signal"):
         raise ValueError("Recoloring expects original signal-domain evaluation, not already colorized images")
     _, manifest, _ = load_manifest(scene, radiometric_dir, protocol)
     display = FrozenDisplay(calibration, protocol)

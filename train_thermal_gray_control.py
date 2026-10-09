@@ -24,7 +24,7 @@ from gaussian_renderer import render
 from utils.thermal_opacity import IROpacityCorrection
 from scene import GaussianModel, Scene
 from utils.loss_utils import ssim
-from utils.thermal_training_utils import thermal_data_loss, held_lr
+from utils.thermal_training_utils import thermal_data_loss, held_lr, masked_mean
 from utils.thermal_observations import prepare_thermal_input, radiometric_image_errors
 from utils.thermal_physics import (
     MaterialThermalField, verify_frozen_geometry_state,
@@ -112,17 +112,18 @@ def evaluate(views, gray, gaussians, pipe, background, dataset, device, beta,
         if prediction.shape != target.shape:
             raise ValueError("Image dimensions differ: " + camera.image_name)
         error = prediction - target
-        mse = float(error.square().mean())
+        mask = getattr(camera, "thermal_valid_mask", None)
+        mse = float(masked_mean(error.square(), mask))
         rows.append({
             "image_name": camera.image_name,
             "PSNR": -10.0 * math.log10(max(mse, 1e-12)),
             "SSIM": float(ssim(prediction[None], target[None])),
-            "MSE": mse, "RMSE": math.sqrt(mse), "MAE": float(error.abs().mean()),
-            "radiance_loss": float(thermal_data_loss(prediction, target, loss_config or {"huber_delta": beta})),
-            "normalized_signal_huber_loss": float(F.smooth_l1_loss(prediction, target, beta=beta)),
+            "MSE": mse, "RMSE": math.sqrt(mse), "MAE": float(masked_mean(error.abs(), mask)),
+            "radiance_loss": float(thermal_data_loss(prediction, target, loss_config or {"huber_delta": beta}, mask)),
+            "normalized_signal_huber_loss": float(masked_mean(F.smooth_l1_loss(prediction, target, beta=beta, reduction="none"), mask)),
         })
         if radiometric_response is not None:
-            rows[-1].update(radiometric_image_errors(prediction, target, radiometric_response))
+            rows[-1].update(radiometric_image_errors(prediction, target, radiometric_response, mask))
         if directory is not None and save_images:
             np.save(directory / "float_arrays" / (camera.image_name + ".prediction.npy"), prediction.cpu().numpy())
             np.save(directory / "float_arrays" / (camera.image_name + ".gt.npy"), target.cpu().numpy())
@@ -177,6 +178,8 @@ def main():
         raise ValueError("Use -m to specify a new, separate output directory")
     checkpoint_path = Path(args.stage2_checkpoint).resolve()
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if checkpoint.get("sh_residual") is not None:
+        raise ValueError("Free scalar control cannot inherit directional SH; use a no-SH Stage2 reference")
     if checkpoint.get("branch") != "stage2":
         raise ValueError("Reference must be a stage2 checkpoint, not C/K/R")
     metadata = checkpoint.get("metadata", {})
@@ -243,6 +246,7 @@ def main():
         args.observation_domain = shared["observation_domain"]
         args.temp_min, args.temp_max = config["temp_min"], config["temp_max"]
         args.radiometric_protocol = shared.get("radiometric_protocol")
+        args.fit_camera_names = metadata["camera_split"]["fit"]
         args.radiometric_dir = args.radiometric_dir or shared.get("radiometric_dir", "")
         planck = prepare_thermal_input(args, scene.getTrainCameras() + scene.getTestCameras(), device)
         initial_gray = field.radiance(planck).detach().clone()
@@ -307,7 +311,7 @@ def main():
         target = target_image(camera, device)
         if prediction.shape != target.shape:
             raise ValueError("Image dimensions differ: " + camera.image_name)
-        loss = thermal_data_loss(prediction, target, shared)
+        loss = thermal_data_loss(prediction, target, shared, getattr(camera, "thermal_valid_mask", None))
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if gray.grad is None or not bool(torch.isfinite(gray.grad).all()):
@@ -353,6 +357,9 @@ def main():
                 "radiometric_protocol": args.radiometric_protocol,
                 "loss_scale_protocol": shared.get("loss_scale_protocol"),
                 "kind": "free_gray_control", "splits": report[phase]}
+            if args.radiometric_protocol["format_version"] == 2:
+                phase_report.update(metric_domain="valid_native_FOV_float_normalized_camera_signal",
+                    signal_metric_region="valid_native_FOV", signal_SSIM_region="full_frame")
             write_json(output / ("evaluation_" + phase) / "metrics.json", phase_report)
     write_json(output / "metrics.json", report)
     print("[done] " + str(output), flush=True)
