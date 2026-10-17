@@ -119,6 +119,35 @@ class StructuredFieldTests(unittest.TestCase):
             self.assertEqual(field.k_raw.requires_grad, branch == "K")
             self.assertEqual(field.delta_epsilon_raw.requires_grad, branch == "R")
 
+    def test_sparse_cache_drops_zero_padding_and_is_not_saved(self):
+        _, field = self.make()
+        matrix = field._temperature_interpolation
+        self.assertTrue(matrix.is_coalesced())
+        self.assertEqual(matrix._nnz(), int((field.control_weights != 0).sum()))
+        self.assertNotIn("_temperature_interpolation", field.state_dict())
+
+    def test_sparse_interpolation_matches_gather_value_and_gradient(self):
+        _, field = self.make()
+        with torch.no_grad():
+            field.temperature_control_raw.copy_(torch.tensor([[.03], [-.07]]))
+        control = field.temperature_control_delta
+        expected = (control[field.control_indices, 0] * field.control_weights).sum(1, keepdim=True)
+        actual = torch.sparse.mm(field._temperature_interpolation, control)
+        grad_output = torch.arange(len(actual), dtype=actual.dtype)[:, None]
+        grad_a = torch.autograd.grad((expected * grad_output).sum(), field.temperature_control_raw, retain_graph=True)[0]
+        grad_b = torch.autograd.grad((actual * grad_output).sum(), field.temperature_control_raw)[0]
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
+        self.assertTrue(torch.allclose(grad_a, grad_b, atol=1e-5, rtol=1e-5))
+
+    def test_cache_is_rebuilt_after_loading_basis_buffers(self):
+        _, field = self.make()
+        state = copy.deepcopy(field.state_dict())
+        state["control_indices"] = 1 - state["control_indices"]
+        field.load_state_dict(state)
+        expected = torch.sparse_coo_tensor(torch.stack((torch.arange(8), state["control_indices"][:, 0])),
+                                           state["control_weights"][:, 0], (8, 2)).coalesce()
+        self.assertTrue(torch.equal(field._temperature_interpolation.indices(), expected.indices()))
+
 
 if __name__ == "__main__":
     unittest.main()

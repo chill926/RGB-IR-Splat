@@ -149,6 +149,7 @@ class StructuredThermalField(MaterialThermalField):
         self.register_buffer("initial_temperature", base.temperature.detach().clone())
         self.register_buffer("environment_normals", normals.detach().clone())
         self.register_buffer("environment_normal_confidence", normal_confidence.detach().clone())
+        self._rebuild_interpolation()
         self.temperature_control_raw = nn.Parameter(base.temperature_raw.new_zeros(len(self.control_positions), 1))
         self.temperature_residual_raw = nn.Parameter(torch.zeros_like(base.temperature_raw))
         self.environment_sh_raw = nn.Parameter(base.environment_raw.new_zeros(8))
@@ -167,9 +168,28 @@ class StructuredThermalField(MaterialThermalField):
     def temperature_local_delta(self):
         return self.residual_bound_K * self.temperature_residual_raw.tanh() * self.temperature_support
 
+    def _rebuild_interpolation(self):
+        # Padding used to index control 0 even at zero weight. Its backward
+        # scattered 165k zero contributions to one address on RoadBlock.
+        keep = self.control_weights != 0
+        rows = torch.arange(len(self.control_indices), device=self.control_indices.device)[:, None]
+        rows = rows.expand_as(self.control_indices)[keep]
+        matrix = torch.sparse_coo_tensor(torch.stack((rows, self.control_indices[keep])),
+            self.control_weights[keep], (len(self.control_indices), len(self.control_positions))).coalesce()
+        # Derived cache: old checkpoints remain loadable and hashes unchanged.
+        if "_temperature_interpolation" in self._buffers:
+            self._temperature_interpolation = matrix
+        else:
+            self.register_buffer("_temperature_interpolation", matrix, persistent=False)
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        super()._load_from_state_dict(*args, **kwargs)
+        if hasattr(self, "control_indices"):
+            self._rebuild_interpolation()
+
     @property
     def temperature(self):
-        coarse = (self.temperature_control_delta[self.control_indices, 0] * self.control_weights).sum(1, keepdim=True)
+        coarse = torch.sparse.mm(self._temperature_interpolation, self.temperature_control_delta)
         return (self.initial_temperature + coarse + self.temperature_local_delta).clamp(self.temp_min, self.temp_max)
 
     @property
