@@ -278,7 +278,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     return cam_infos
 
 
-def readRGBTCameras(cam_extrinsics, cam_intrinsics, rgb_folder, thermal_folder):
+def readRGBTCameras(cam_extrinsics, cam_intrinsics, rgb_folder, thermal_folder,
+                    rgb_geometry_stage=False, thermal_signal_source=False):
     cam_infos = []
     num_frames = len(cam_extrinsics)
     frame_index_base = _frame_index_base([os.path.splitext(os.path.basename(cam_extrinsics[key].name))[0]
@@ -312,8 +313,9 @@ def readRGBTCameras(cam_extrinsics, cam_intrinsics, rgb_folder, thermal_folder):
         basename = os.path.basename(extr.name)
         rgb_path = os.path.join(rgb_folder, basename)
         thermal_path = os.path.join(thermal_folder, basename)
-        rgb_exists, thermal_exists = os.path.exists(rgb_path), os.path.exists(thermal_path)
-        if rgb_exists != thermal_exists:
+        rgb_exists = os.path.exists(rgb_path)
+        thermal_exists = os.path.exists(thermal_path) if not rgb_geometry_stage else False
+        if not rgb_geometry_stage and rgb_exists != thermal_exists:
             raise FileNotFoundError(
                 f"Incomplete RGBT pair for {basename}: rgb_exists={rgb_exists}, "
                 f"thermal_exists={thermal_exists}"
@@ -322,10 +324,27 @@ def readRGBTCameras(cam_extrinsics, cam_intrinsics, rgb_folder, thermal_folder):
             continue
 
         rgb_image = Image.open(rgb_path).convert("RGB")
-        with Image.open(thermal_path) as thermal_source:
-            physical_image = _thermal_to_gray_rgb(thermal_source)
-        thermal_u8 = np.rint(physical_image[..., 0] * 255.0).clip(0, 255).astype(np.uint8)
-        thermal_image = Image.fromarray(thermal_u8, mode="L").convert("RGB")
+        if rgb_geometry_stage:
+            # Static RGB 3DGS does not consume thermal observations. Do not
+            # decode pseudocolor or synthesize physical values from RGB.
+            image = rgb_image
+            image_path = rgb_path
+            physical_image = None
+            thermal_path = None
+        elif thermal_signal_source:
+            # Prepared RJPEG targets replace this canvas before any thermal
+            # loss. Preserve the thermal camera resolution without interpreting
+            # a palette image as radiance or temperature.
+            with Image.open(thermal_path) as thermal_source:
+                image = Image.new("RGB", thermal_source.size)
+            image_path = thermal_path
+            physical_image = None
+        else:
+            with Image.open(thermal_path) as thermal_source:
+                physical_image = _thermal_to_gray_rgb(thermal_source)
+            thermal_u8 = np.rint(physical_image[..., 0] * 255.0).clip(0, 255).astype(np.uint8)
+            image = Image.fromarray(thermal_u8, mode="L").convert("RGB")
+            image_path = thermal_path
         image_name = Path(basename).stem
         fid = _image_name_to_time(image_name, idx, num_frames, frame_index_base)
 
@@ -335,8 +354,8 @@ def readRGBTCameras(cam_extrinsics, cam_intrinsics, rgb_folder, thermal_folder):
             T=T,
             FovY=FovY,
             FovX=FovX,
-            image=thermal_image,
-            image_path=thermal_path,
+            image=image,
+            image_path=image_path,
             image_name=image_name,
             width=width,
             height=height,
@@ -442,8 +461,12 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, load_sparse_depth=False)
     return scene_info
 
 
-def readRGBTSceneInfo(path, images, eval):
+def readRGBTSceneInfo(path, images, eval, rgb_geometry_stage=False, thermal_signal_source=False):
     del images
+    if rgb_geometry_stage:
+        print("RGB Stage1: loading RGB observations only; thermal observations are not used.")
+    elif thermal_signal_source:
+        print("Prepared RJPEG observations: loading thermal canvas dimensions; no palette-to-signal conversion.")
     sparse_root = os.path.join(path, "sparse/0")
     if not os.path.exists(sparse_root):
         sparse_root = os.path.join(path, "colmap/sparse/0")
@@ -463,6 +486,8 @@ def readRGBTSceneInfo(path, images, eval):
         cam_intrinsics=cam_intrinsics,
         rgb_folder=os.path.join(path, "rgb/train"),
         thermal_folder=os.path.join(path, "thermal/train"),
+        rgb_geometry_stage=rgb_geometry_stage,
+        thermal_signal_source=thermal_signal_source,
     )
     train_cam_infos = sorted(train_cam_infos, key=lambda x: x.image_name)
 
@@ -471,6 +496,8 @@ def readRGBTSceneInfo(path, images, eval):
         cam_intrinsics=cam_intrinsics,
         rgb_folder=os.path.join(path, "rgb/test"),
         thermal_folder=os.path.join(path, "thermal/test"),
+        rgb_geometry_stage=rgb_geometry_stage,
+        thermal_signal_source=thermal_signal_source,
     )
     test_cam_infos = sorted(test_cam_infos, key=lambda x: x.image_name)
 

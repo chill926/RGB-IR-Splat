@@ -109,6 +109,11 @@ def main():
     observation_args = SimpleNamespace(**shared)
     observation_args.fit_camera_names = metadata.get("camera_split", {}).get("fit")
     use_pseudocolor = args.thermal_output == "pseudocolor"
+    is_stage3 = bool(metadata.get("stage3_protocol") or metadata.get("stage3_common_endpoint"))
+    if is_stage3:
+        args.resolution = shared["resolution"]
+        if use_pseudocolor and not args.display_calibration:
+            args.display_calibration = metadata["joint_protocol"]["display_calibration"]
     if use_pseudocolor and (args.modality != "thermal" or shared["observation_domain"] != "raw_rjpeg"):
         raise ValueError("Pseudo-color output requires --modality thermal and a raw_rjpeg checkpoint")
     if use_pseudocolor and not args.display_calibration:
@@ -138,6 +143,8 @@ def main():
     dataset = model_params.extract(args)
     if args.modality == "rgb":
         dataset.rgb_geometry_stage = True
+    elif shared["observation_domain"] == "raw_rjpeg":
+        dataset.thermal_signal_source = True
     pipeline = pipeline_params.extract(args)
     output_root.mkdir(parents=True, exist_ok=True)
     gaussians = GaussianModel(dataset.sh_degree, device)
@@ -180,7 +187,8 @@ def main():
         "branch": branch,
         "training_stage": metadata.get("training_stage", branch),
         "modality": args.modality,
-        "evaluated_stage": ("joint_D" if joint_protocol is not None else
+        "evaluated_stage": (metadata["training_stage"] if metadata.get("stage3_protocol") or metadata.get("stage3_common_endpoint") else
+                            "joint_D" if joint_protocol is not None else
                             ("stage1_rgb" if args.modality == "rgb" else branch)),
         "geometry_evaluated": "checkpoint_joint_geometry" if joint_protocol is not None else "Stage1_initializer",
         "joint_protocol": joint_protocol,

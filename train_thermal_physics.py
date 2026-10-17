@@ -25,7 +25,7 @@ from utils.thermal_physics import (MaterialThermalField,
     verify_frozen_geometry_state)
 
 
-def parse_args():
+def parse_args(configure_parser=None):
     parser = argparse.ArgumentParser(description=__doc__)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model, pipeline = ModelParams(parser, device), PipelineParams(parser)
@@ -128,6 +128,8 @@ def parse_args():
     parser.add_argument("--lambda_temperature_supervision", type=float, default=0.0)
     parser.add_argument("--oracle_temperature_supervision", action="store_true", default=False,
                         help="Required acknowledgement for non-main experiments that train with temperature truth")
+    if configure_parser is not None:
+        configure_parser(parser)
     args = parser.parse_args()
     args.geometry_model, args.model_path = os.path.abspath(args.geometry_model), os.path.abspath(args.model_path)
     args.source_path = os.path.abspath(args.source_path)
@@ -148,7 +150,7 @@ def observation_to_model_radiance(image, args, planck):
         if not bool(torch.isfinite(image).all()) or bool(((image < 0) | (image > 1)).any()):
             raise ValueError("Invalid prepared RJPEG target")
         return image
-    if args.observation_domain == "normalized_dn":
+    if args.observation_domain in ("normalized_dn", "pseudocolor_rgb"):
         return image.clamp(0.0, 1.0)
     if args.observation_domain == "apparent_temperature":
         temperature = image * args.thermal_raw_max * args.temperature_scale + args.temperature_offset

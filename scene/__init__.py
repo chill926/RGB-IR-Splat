@@ -48,7 +48,11 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        has_rgbt_images = os.path.exists(os.path.join(args.source_path, "rgb")) and os.path.exists(os.path.join(args.source_path, "thermal"))
+        rgb_geometry_stage = bool(getattr(args, "rgb_geometry_stage", False))
+        thermal_signal_source = bool(getattr(args, "thermal_signal_source", False))
+        has_rgbt_images = os.path.exists(os.path.join(args.source_path, "rgb")) and (
+            rgb_geometry_stage or os.path.exists(os.path.join(args.source_path, "thermal"))
+        )
         has_rgbt_sparse = (
             os.path.exists(os.path.join(args.source_path, "sparse"))
             or os.path.exists(os.path.join(args.source_path, "colmap", "sparse"))
@@ -57,12 +61,23 @@ class Scene:
         assert data_branch in ("auto", "ir", "rgbt"), "--data_branch must be one of: auto, ir, rgbt"
 
         if data_branch == "rgbt":
-            assert has_rgbt_images and has_rgbt_sparse, "RGBT branch requires rgb/, thermal/, and sparse/ or colmap/sparse/."
+            assert has_rgbt_images and has_rgbt_sparse, (
+                "RGBT branch requires rgb/ (plus thermal/ outside RGB Stage1), "
+                "and sparse/ or colmap/sparse/."
+            )
             print("Using RGBT scene branch.")
-            scene_info = sceneLoadTypeCallbacks["RGBT"](args.source_path, args.images, args.eval)
+            scene_info = sceneLoadTypeCallbacks["RGBT"](
+                args.source_path, args.images, args.eval,
+                rgb_geometry_stage=rgb_geometry_stage,
+                thermal_signal_source=thermal_signal_source,
+            )
         elif data_branch == "auto" and has_rgbt_images and has_rgbt_sparse:
             print("Found rgb/thermal folders, assuming RGBT scene!")
-            scene_info = sceneLoadTypeCallbacks["RGBT"](args.source_path, args.images, args.eval)
+            scene_info = sceneLoadTypeCallbacks["RGBT"](
+                args.source_path, args.images, args.eval,
+                rgb_geometry_stage=rgb_geometry_stage,
+                thermal_signal_source=thermal_signal_source,
+            )
         elif os.path.exists(os.path.join(args.source_path, "sparse")):
             if data_branch == "ir":
                 print("Using IR-only scene branch.")
