@@ -159,8 +159,10 @@ def assert_frozen(checkpoint, field, gaussians, sh):
     if tensor_digest(sh.state_dict()) != common["sh_sha256"] or sh.raw.requires_grad:
         raise RuntimeError("Stage3 changed thermal SH")
     for name, value in field.named_buffers():
-        if not torch.equal(value.cpu(), checkpoint["state_dict"][name].cpu()):
+        if name in checkpoint["state_dict"] and not torch.equal(value.cpu(), checkpoint["state_dict"][name].cpu()):
             raise RuntimeError("Stage3 changed frozen material buffer: " + name)
+    if hasattr(field, "structure_digest") and field.structure_digest() != field.frozen_structure_sha256:
+        raise RuntimeError("Stage3 changed frozen temperature basis or environment normals")
 
 
 def lock_protocol(path, protocol):

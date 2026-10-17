@@ -260,6 +260,9 @@ class MaterialThermalField(nn.Module):
 
     @classmethod
     def from_checkpoint(cls, checkpoint, branch, device, reset_branch_parameters=True):
+        if checkpoint.get("field_parameterization"):
+            from utils.thermal_structured import StructuredThermalField
+            return StructuredThermalField.restore(checkpoint, branch, device, reset_branch_parameters)
         state = checkpoint["state_dict"]
         config = checkpoint["config"]
         epsilon0 = state.get("epsilon0_by_material")

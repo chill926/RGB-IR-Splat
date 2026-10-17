@@ -26,6 +26,7 @@ from utils.thermal_stage3 import (assert_frozen, atomic_save, file_sha256, lock_
 from utils.thermal_training_utils import held_lr, install_loss_scale, thermal_data_loss
 from utils.thermal_spatial import TemperatureSpatialPrior
 from utils.sh_utils import SH2RGB
+from utils.thermal_structured import StructuredThermalField, build_temperature_basis, frozen_surface_normals
 
 
 def parse_args():
@@ -55,6 +56,20 @@ def parse_args():
     parser.add_argument("--spatial_rgb_sigma", type=float, default=.15)
     parser.add_argument("--spatial_material_boundary_weight", type=float, default=.1)
     parser.add_argument("--spatial_unknown_weight", type=float, default=.1)
+    parser.add_argument("--structured_field", action="store_true",
+                        help="Shared local temperature updates + bounded local residual + global SH2 environment")
+    parser.add_argument("--temperature_controls", type=int, default=4096)
+    parser.add_argument("--temperature_control_bound_K", type=float, default=5.)
+    parser.add_argument("--temperature_residual_bound_K", type=float, default=.5)
+    parser.add_argument("--temperature_residual_sigma_K", type=float, default=.1)
+    parser.add_argument("--temperature_residual_lr", type=float, default=1e-4)
+    parser.add_argument("--temperature_residual_lr_final", type=float, default=1e-6)
+    parser.add_argument("--lambda_temperature_residual", type=float, default=1e-3)
+    parser.add_argument("--lambda_temperature_control", type=float, default=1e-4)
+    parser.add_argument("--environment_sh_bound", type=float, default=.01)
+    parser.add_argument("--environment_sh_lr", type=float, default=1e-3)
+    parser.add_argument("--environment_sh_lr_final", type=float, default=1e-5)
+    parser.add_argument("--lambda_environment_sh", type=float, default=1e-4)
     args = parser.parse_args()
     if min(args.steps, args.eval_every, args.save_every, args.log_every) <= 0:
         parser.error("Budget and intervals must be positive")
@@ -65,6 +80,17 @@ def parse_args():
         parser.error("Invalid material learning rates/regularization")
     if not math.isfinite(args.lambda_spatial) or args.lambda_spatial < 0:
         parser.error("lambda_spatial must be finite and nonnegative")
+    if args.temperature_controls < 1 or any(not math.isfinite(v) or v <= 0 for v in
+            (args.temperature_control_bound_K, args.temperature_residual_bound_K,
+             args.temperature_residual_sigma_K, args.environment_sh_bound,
+             args.temperature_residual_lr, args.temperature_residual_lr_final,
+             args.environment_sh_lr, args.environment_sh_lr_final)):
+        parser.error("Invalid structured field bounds or learning rates")
+    if (args.temperature_residual_lr_final > args.temperature_residual_lr
+            or args.environment_sh_lr_final > args.environment_sh_lr
+            or any(not math.isfinite(v) or v < 0 for v in (args.lambda_temperature_residual,
+                    args.lambda_temperature_control, args.lambda_environment_sh))):
+        parser.error("Invalid structured regularization or learning rate schedule")
     if not args.model_path:
         parser.error("An empty, separate output directory (-m) is required")
     if args.source_path or args.load_model_path:
@@ -161,10 +187,13 @@ def diagnostics(field, gradients=None):
             row["material_data_gradient_raw"] = gradients.get("material_data_gradient_raw", [0.] * len(field.material_names))[material_id]
         rows.append(row)
     temperature = field.temperature
-    return {"environment": float(field.environment), "materials": rows,
+    result = {"environment": float(field.environment), "materials": rows,
             "temperature_bound_fraction": float(((temperature <= field.temp_min + .5) |
                                                     (temperature >= field.temp_max - .5)).float().mean()),
             "unknown_gaussians": int((field.material_ids == -1).sum())}
+    if hasattr(field, "structured_diagnostics"):
+        result["structured_field"] = field.structured_diagnostics()
+    return result
 
 
 def run(args, model, pipeline, device):
@@ -193,6 +222,16 @@ def run(args, model, pipeline, device):
         material_boundary_weight=args.spatial_material_boundary_weight, unknown_weight=args.spatial_unknown_weight)
     if args.lambda_spatial > 0 and not spatial_prior.source.numel():
         raise ValueError("No supported local edges for the spatial temperature prior")
+    if args.structured_field:
+        centers = torch.stack([camera.camera_center.to(device) for camera in c.splits["fit"]])
+        normals, confidence = frozen_surface_normals(c.gaussians.get_xyz, c.gaussians.get_scaling,
+                                                     c.gaussians.get_rotation, centers)
+        basis, basis_protocol = build_temperature_basis(c.gaussians.get_xyz, field.material_ids,
+            c.sh.fit_support, spatial_prior, normals, max_controls=args.temperature_controls)
+        field = StructuredThermalField(field, basis, normals, confidence, basis_protocol,
+            control_bound_K=args.temperature_control_bound_K, residual_bound_K=args.temperature_residual_bound_K,
+            residual_sigma_K=args.temperature_residual_sigma_K, environment_sh_bound=args.environment_sh_bound).to(device)
+        c.field = field
     if args.branch != "C" and not bool(field.learn_k_by_material.any()):
         raise ValueError("No material enabled for R/K")
     protocol = {"kind": "frozen_D_C_R_K_pilot_v1", "common_sha256": file_sha256(args.common),
@@ -222,17 +261,32 @@ def run(args, model, pipeline, device):
                                  Path(__file__).parent / "utils/thermal_observations.py",
                                  Path(__file__).parent / "utils/thermal_training_utils.py",
                                  Path(__file__).parent / "utils/thermal_spatial.py",
+                                 Path(__file__).parent / "utils/thermal_structured.py",
                                  Path(__file__).parent / "scene/dataset_readers.py",
                                  Path(__file__).parent / "scene/__init__.py",
                                  Path(__file__).parent / "gaussian_renderer/__init__.py"]}}
+    if args.structured_field:
+        protocol["kind"] = "frozen_D_C_R_K_structured_v1"
+        protocol["field_parameterization"] = field.export_state()["field_parameterization"]
+        protocol["structured_optimization"] = {name: getattr(args, name) for name in
+            ("temperature_residual_lr", "temperature_residual_lr_final", "environment_sh_lr",
+             "environment_sh_lr_final", "lambda_temperature_residual", "lambda_temperature_control",
+             "lambda_environment_sh")}
     lock_sha = lock_protocol(args.comparison_protocol, protocol)
     output.mkdir(parents=True, exist_ok=True)
     (output / "experiment_plan.json").write_text(json.dumps(dict(protocol, branch=args.branch), indent=2) + "\n")
     (output / "spatial_prior.json").write_text(json.dumps(spatial_prior.protocol, indent=2) + "\n")
-    groups = [{"name": "temperature", "params": [field.temperature_raw],
+    temperature_parameter = field.temperature_control_raw if args.structured_field else field.temperature_raw
+    groups = [{"name": "temperature", "params": [temperature_parameter],
                "start": obs.temperature_lr, "end": obs.temperature_lr_final},
               {"name": "environment", "params": [field.environment_raw],
                "start": obs.environment_lr, "end": obs.environment_lr_final}]
+    if args.structured_field:
+        groups.extend([
+            {"name": "temperature_residual", "params": [field.temperature_residual_raw],
+             "start": args.temperature_residual_lr, "end": args.temperature_residual_lr_final},
+            {"name": "environment_sh", "params": [field.environment_sh_raw],
+             "start": args.environment_sh_lr, "end": args.environment_sh_lr_final}])
     if args.branch != "C":
         parameter = field.k_raw if args.branch == "K" else field.delta_epsilon_raw
         groups.append({"name": "material", "params": [parameter],
@@ -243,7 +297,7 @@ def run(args, model, pipeline, device):
         raise RuntimeError("Optimizer parameter set violates Stage3 contract")
     optimizer = torch.optim.Adam([dict(group, lr=group["start"]) for group in groups])
     anchor = field.environment.detach().clone()
-    initial_T = field.temperature_raw.detach().clone()
+    initial_T = temperature_parameter.detach().clone()
     initial_E = field.environment_raw.detach().clone()
     def log(row):
         with (output / "stage3_training.jsonl").open("a") as handle:
@@ -287,8 +341,11 @@ def run(args, model, pipeline, device):
         display_term = image_loss(c.display(prediction, camera.image_name), c.targets[camera.image_name].to(device), mask)
         data_loss = c.weights.lambda_signal * signal + c.weights.lambda_display * display_term
         data_loss.backward()
-        gradients = {"temperature_data_gradient_abs_mean": float(field.temperature_raw.grad.abs().mean()),
+        gradients = {"temperature_data_gradient_abs_mean": float(temperature_parameter.grad.abs().mean()),
                      "environment_data_gradient_raw": float(field.environment_raw.grad)}
+        if args.structured_field:
+            gradients["temperature_residual_data_gradient_abs_mean"] = float(field.temperature_residual_raw.grad.abs().mean())
+            gradients["environment_sh_data_gradient_abs_mean"] = float(field.environment_sh_raw.grad.abs().mean())
         if args.branch != "C":
             raw = field.k_raw if args.branch == "K" else field.delta_epsilon_raw
             gradients["material_data_gradient_raw"] = raw.grad.detach().cpu().tolist()
@@ -302,10 +359,18 @@ def run(args, model, pipeline, device):
             with torch.no_grad():
                 spatial = spatial_prior(field.temperature)
         regularization = obs.lambda_environment * environment + material_weight * material + args.lambda_spatial * spatial
+        structure_losses = {}
+        if args.structured_field:
+            residual_prior, control_prior, environment_sh_prior = field.structure_regularizers()
+            regularization = (regularization + args.lambda_temperature_residual * residual_prior
+                + args.lambda_temperature_control * control_prior + args.lambda_environment_sh * environment_sh_prior)
+            structure_losses = {"temperature_residual_prior": float(residual_prior.detach()),
+                "temperature_control_prior": float(control_prior.detach()),
+                "environment_sh_prior": float(environment_sh_prior.detach())}
         spatial_gradient_mean = None
         if args.lambda_spatial > 0 and (step == 1 or step % args.log_every == 0 or step == args.steps):
             spatial_gradient_mean = float(torch.autograd.grad(args.lambda_spatial * spatial,
-                field.temperature_raw, retain_graph=True)[0].abs().mean())
+                temperature_parameter, retain_graph=True)[0].abs().mean())
         regularization.backward()
         if not bool(torch.isfinite(data_loss)) or not bool(torch.isfinite(regularization)):
             raise FloatingPointError("Non-finite Stage3 loss")
@@ -321,7 +386,7 @@ def run(args, model, pipeline, device):
                      weighted_spatial_temperature_loss=float((args.lambda_spatial * spatial).detach()),
                      temperature_spatial_gradient_abs_mean=spatial_gradient_mean,
                      learning_rates={group["name"]: group["lr"] for group in optimizer.param_groups},
-                     **gradients, diagnostics=diagnostics(field, gradients)))
+                     **gradients, **structure_losses, diagnostics=diagnostics(field, gradients)))
         if step % args.eval_every == 0 or step == args.steps:
             metrics = validate()
             log({"step": step, "validation": metrics})
@@ -333,7 +398,7 @@ def run(args, model, pipeline, device):
     save("thermal_" + args.branch + "_final.pt", args.steps, metrics)
     summary = {"branch": args.branch, "best_step": best_step, "stopped_step": args.steps,
                "best_validation_objective": best, "final_validation_metrics": metrics,
-               "temperature_raw_max_update": float((field.temperature_raw - initial_T).abs().max()),
+               "temperature_raw_max_update": float((temperature_parameter - initial_T).abs().max()),
                "environment_raw_update": float((field.environment_raw - initial_E).abs().max()),
                "material_data_gradient_abs_max_by_material": material_gradient_max,
                "frozen_state_verified": True, "diagnostics": diagnostics(field), "protocol": protocol}
